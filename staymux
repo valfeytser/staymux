@@ -1,0 +1,570 @@
+#!/usr/bin/env bash
+# /usr/local/bin/staymux (755)
+#
+# ------------------------------------------------------------------------------
+# staymux - persistent tmux sessions wrapped in a systemd-user scope
+#
+# WHY
+# ______________________________________________________________________________
+# - tmux is great for long-running terminal work, but - without special care -
+#   every session dies when a user logs out, is timed-out, or all terminals close.
+# - systemd's per-user instance can keep processes alive ("linger") after every
+#   terminal is closed or the user logs out.
+# - staymux marries the two:
+#     - First call spins up ONE tmux server inside a dedicated scope
+#       (stmux-<user>.scope) and enables linger automatically.
+#     - Subsequent calls attach or create sessions without needing root
+#       privileges or extra daemons.
+
+# ----- Constants --------------------------------------------------------------
+
+is_tty() { [[ -t 1 ]]; }
+if is_tty; then
+    CYAN='\e[96m'
+    YELLOW='\e[93m'
+    RESET='\e[0m'
+else
+    CYAN=
+    YELLOW=
+    RESET=
+fi
+
+say()  { printf '%b\n' "$*"; }
+
+info() {
+    # pre_pad controls whether a leading blank line (echo) is printed
+    # before the message by default, set to 0 by '--no-pad'; the trailing
+    # echo always runs.
+    local pre_pad=1
+    if [[ ${1:-} == "--no-pad" ]]; then
+        pre_pad=0
+        shift
+    fi
+    ((pre_pad)) && echo
+    say "${CYAN}$*${RESET}"
+    echo
+}
+
+warn() {
+    local pre_pad=1
+    local post_pad=1
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --no-leading)
+                pre_pad=0
+                shift
+                ;;
+            --no-trailing)
+                post_pad=0
+                shift
+                ;;
+            --)
+                shift
+                break
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+
+    ((pre_pad)) && echo
+    say "${YELLOW}$*${RESET}"
+    ((post_pad)) && echo
+}
+
+safe_user=${USER%%@*}            # strip "@domain"
+unit="stmux-${safe_user}.scope"  # one scope per user
+lockfile="/tmp/staymux-${safe_user}.lock"
+
+read -r -d '' help <<'EOF'
+USAGE
+    staymux [options] [session_name]
+
+    <session_name>        Create or attach to a named session.
+    -h                    Show this help message.
+    -e                    Show examples.
+    -l                    List active sessions.
+    -k <session | all>    Kill a specific session or all sessions.
+
+TMUX SHORTCUTS
+    Ctrl+b d              Detach from session.
+    Ctrl+b %              Split pane vertically.
+    Ctrl+b "              Split pane horizontally.
+    Ctrl+b <arrows>       Switch between panes.
+    Ctrl+b ?              List all shortcuts.
+EOF
+
+read -r -d '' examples <<'EOF'
+EXAMPLES
+    $ staymux
+      - If no sessions exist, creates one named after the hostname.
+      - If only ONE session exists, attaches to it.
+      - If MULTIPLE sessions exist, lists them.
+
+    $ staymux dev1
+      - Creates or attaches to the session named "dev1".
+
+    $ staymux -l
+      - Lists all active sessions.
+
+    $ staymux -k dev1
+      - Kills the session named "dev1".
+
+    $ staymux -k all
+      - Kills the tmux server, stopping ALL active sessions.
+EOF
+
+read -r -d '' root_msg <<'EOF'
+staymux: You are running as root.
+    - staymux is designed for per-user systemd scopes, which do not
+      exist for UID 0 by default.
+    - Use a non-root account for persistent sessions that can be
+      managed with "systemctl --user".
+    - You can still run 'tmux' as root, but sessions will not persist.
+EOF
+
+read -r -d '' nesting_msg <<'EOF'
+staymux: You are already inside a tmux session (TMUX is set).
+Nesting tmux inside tmux is discouraged; see ‘man tmux’.
+EOF
+
+# ----- Functions --------------------------------------------------------------
+validate_session_name() {
+    local name="$1"
+
+    # Check for empty name
+    if [[ -z "$name" ]]; then
+        warn "staymux: Session name cannot be empty"
+        return 1
+    fi
+
+    # Check length (tmux has a practical limit)
+    if [[ ${#name} -gt 256 ]]; then
+        warn "staymux: Session name too long (max 256 characters)"
+        return 1
+    fi
+
+    # Check for dangerous characters that could enable command injection
+    # Allow: alphanumeric, dash, underscore, dot
+    if [[ ! "$name" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+        warn "staymux: Invalid session name. Use only letters, numbers, dots, dashes, and underscores"
+        return 1
+    fi
+
+    # Additional check for reserved names
+    if [[ "$name" == "all" ]]; then
+        warn "staymux: 'all' is a reserved name. Please choose another session name."
+        return 1
+    fi
+
+    return 0
+}
+
+acquire_lock() {
+    # Create a lock using file descriptor to prevent race conditions
+    # when multiple staymux instances start simultaneously
+    exec 200>"$lockfile"
+    if ! flock -n 200; then
+        warn "staymux: Another instance is already starting. Please wait..."
+        # Wait for lock with timeout
+        if ! flock -w 10 200; then
+            warn "staymux: Timeout waiting for lock. Another instance may be stuck."
+            return 1
+        fi
+    fi
+    return 0
+}
+
+release_lock() {
+    # Release the file descriptor lock
+    exec 200>&-
+    rm -f "$lockfile" 2>/dev/null || true
+}
+
+cleanup() {
+    # Cleanup function called on script exit/interruption
+    release_lock
+    exit 130
+}
+
+setup_signal_handlers() {
+    # Set up signal handlers for graceful cleanup
+    trap cleanup SIGINT SIGTERM
+}
+
+check_version() {
+    local cmd="$1"
+    local min_version="$2"
+    local current_version="$3"
+
+    # Simple version comparison (assumes semantic versioning)
+    if [[ "$(printf '%s\n' "$min_version" "$current_version" | sort -V | head -n1)" != "$min_version" ]]; then
+        warn "staymux: $cmd version $current_version is too old (minimum: $min_version)"
+        return 1
+    fi
+    return 0
+}
+
+is_ubuntu_like() {
+    [[ "$ID" == "ubuntu" ]] || [[ "$ID_LIKE" == *"ubuntu"* ]]
+}
+
+is_rhel_like() {
+    [[ "$ID" =~ ^(rhel|centos|rocky|almalinux)$ ]] || [[ "$ID_LIKE" == *"rhel"* ]] || [[ "$ID_LIKE" == *"fedora"* ]]
+}
+
+check_os_version() {
+    # Check if running on a supported OS version
+    if [[ -f /etc/os-release ]]; then
+        source /etc/os-release
+
+        if is_ubuntu_like; then
+            # Ubuntu/Ubuntu-based systems
+            if [[ -n "$VERSION_ID" ]]; then
+                if ! check_version "Ubuntu" "18.04" "$VERSION_ID"; then
+                    warn "staymux: Ubuntu 18.04 LTS or later (or equivalent) is required"
+                    return 1
+                fi
+            fi
+        elif is_rhel_like; then
+            # RHEL/CentOS-like systems
+            if [[ -n "$VERSION_ID" ]]; then
+                local major_version="${VERSION_ID%%.*}"
+                if ! check_version "RHEL/CentOS" "8" "$major_version"; then
+                    warn "staymux: RHEL/CentOS 8 or later (or equivalent) is required"
+                    return 1
+                fi
+            fi
+        elif [[ "$ID" == "fedora" ]]; then
+            if [[ -n "$VERSION_ID" ]]; then
+                if ! check_version "Fedora" "28" "$VERSION_ID"; then
+                    warn "staymux: Fedora 28 or later is required"
+                    return 1
+                fi
+            fi
+        elif [[ "$ID" == "debian" ]]; then
+            if [[ -n "$VERSION_ID" ]]; then
+                if ! check_version "Debian" "10" "$VERSION_ID"; then
+                    warn "staymux: Debian 10 (Buster) or later is required"
+                    return 1
+                fi
+            fi
+        elif [[ "$ID" =~ ^opensuse.*|suse$ ]]; then
+            # openSUSE Leap 15.0+ aligns with newer systemd requirements
+            if [[ -n "$VERSION_ID" ]] && [[ "$ID" == "opensuse-leap" ]]; then
+                if ! check_version "openSUSE Leap" "15.0" "$VERSION_ID"; then
+                    warn "staymux: openSUSE Leap 15.0 or later is required"
+                    return 1
+                fi
+            fi
+        elif [[ "$ID" == "arch" ]]; then
+            # Arch Linux is rolling release and has had systemd support for years
+            return 0
+        else
+            warn "staymux: Unknown or unsupported OS ($ID). Modern systemd required.\n    Supported: Ubuntu 18.04+ (and derivatives), RHEL/CentOS 8+ (and derivatives), Fedora 28+, Debian 10+, openSUSE 15.0+"
+            return 1
+        fi
+    else
+        warn "staymux: Cannot determine OS version (/etc/os-release not found)\n    Ensure you're running a Linux distribution with systemd user scope support"
+        return 1
+    fi
+    return 0
+}
+
+check_dependencies() {
+    # Check tmux
+    if ! command -v tmux >/dev/null 2>&1; then
+        warn "staymux: tmux is not installed or not in PATH"
+        return 1
+    fi
+
+    # Check tmux version (require 2.1+ for proper session handling)
+    local tmux_version
+    tmux_version=$(tmux -V 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -n1)
+    if [[ -n "$tmux_version" ]]; then
+        if ! check_version "tmux" "2.1" "$tmux_version"; then
+            return 1
+        fi
+    else
+        warn "staymux: Cannot determine tmux version"
+        return 1
+    fi
+
+    # Check systemd version (require 230+ for user scopes)
+    if command -v systemctl >/dev/null 2>&1; then
+        local systemd_version
+        systemd_version=$(systemctl --version 2>/dev/null | head -n1 | grep -oE '[0-9]+' | head -n1)
+        if [[ -n "$systemd_version" ]]; then
+            if ! check_version "systemd" "230" "$systemd_version"; then
+                return 1
+            fi
+        else
+            warn "staymux: Cannot determine systemd version"
+            return 1
+        fi
+    else
+        warn "staymux: systemctl not found"
+        return 1
+    fi
+
+    return 0
+}
+
+ensure_not_root() {
+    if [[ $EUID -eq 0 ]]; then
+        warn "$root_msg"
+        exit 1
+    fi
+}
+
+check_systemd_user_availability() {
+    # Check if systemd user instance is available and running
+    if ! command -v systemd-run >/dev/null 2>&1; then
+        warn "staymux: systemd-run not found. systemd is required for persistent sessions."
+        return 1
+    fi
+
+    if ! command -v loginctl >/dev/null 2>&1; then
+        warn "staymux: loginctl not found. systemd-logind is required."
+        return 1
+    fi
+
+    # Check if user systemd instance is running
+    if ! systemctl --user status >/dev/null 2>&1; then
+        warn "staymux: systemd user instance is not running.\n    Try: systemctl --user start"
+        return 1
+    fi
+
+    # Check if we can create scopes
+    if ! systemd-run --user --quiet --scope --unit="staymux-test-$$" true 2>/dev/null; then
+        warn "staymux: Cannot create systemd user scopes.\n    Your systemd version may not support user scopes."
+        return 1
+    fi
+
+    return 0
+}
+
+enable_linger() {
+    local linger_status
+    if ! linger_status=$(loginctl show-user "$USER" --property=Linger --value 2>/dev/null); then
+        warn "staymux: Failed to check linger status for user $USER"
+        return 1
+    fi
+
+    if [[ "$linger_status" != "yes" ]]; then
+        if ! loginctl enable-linger "$USER" 2>/dev/null; then
+            warn "staymux: Failed to enable linger for user $USER.\n    Please run 'loginctl enable-linger $USER' as root."
+            return 1
+        fi
+    fi
+    return 0
+}
+
+tmux_server_running() {
+    # This function just checks if the server process is alive.
+    tmux list-sessions >/dev/null 2>&1
+}
+
+switch_to_session() {
+    # Switch the attached client to the named session, creating it if needed.
+    local target="$1"
+    if tmux has-session -t "$target" 2>/dev/null; then
+        tmux switch-client -t "$target"
+    else
+        tmux new-session -Ad -s "$target"
+        tmux switch-client -t "$target"
+    fi
+}
+
+get_sessions() {
+    # Returns a list of session names, one per line.
+    if ! tmux list-sessions -F '#{session_name}' 2>/dev/null; then
+        # If tmux fails, return empty list rather than hiding the error
+        return 0
+    fi
+}
+
+list_sessions() {
+    local sessions=()
+    if ! mapfile -t sessions < <(get_sessions); then
+        warn "staymux: Failed to list sessions"
+        return 1
+    fi
+
+    if [[ ${#sessions[@]} -eq 0 ]]; then
+        warn "No active sessions."
+        return 0
+    fi
+
+    local current_session=""
+    if [[ -n "${TMUX:-}" ]]; then
+        current_session=$(tmux display-message -p '#S' 2>/dev/null || true)
+        warn --no-trailing "Active sessions: (* current)"
+    else
+        warn --no-trailing "Active sessions:"
+    fi
+
+    local name suffix
+    for name in "${sessions[@]}"; do
+        suffix=""
+        if [[ -n "$current_session" && "$name" == "$current_session" ]]; then
+            suffix="*"
+        fi
+        printf "${YELLOW}    - %s%s\n${RESET}" "$name" "$suffix"
+    done
+    echo
+}
+
+# Centralized function to run a tmux command, wrapping it in
+# systemd-run only when the server isn't already running.
+run_tmux_cmd() {
+    if tmux_server_running; then
+        tmux "$@"
+    else
+        # Starting new persistent tmux server - acquire lock first
+        if ! acquire_lock; then
+            return 1
+        fi
+
+        # Double-check server isn't running after acquiring lock
+        if tmux_server_running; then
+            release_lock
+            tmux "$@"
+        else
+            # Start the server in systemd scope
+            if systemd-run --user --quiet --scope --unit="$unit" -- tmux "$@"; then
+                release_lock
+            else
+                release_lock
+                return 1
+            fi
+        fi
+    fi
+}
+
+staymux() {
+    # ----- Option Parsing ----------------------------------------------------
+    while getopts ":helk:" opt; do
+        case "$opt" in
+            h)
+                info "$help"
+                return 0
+                ;;
+            e)
+                info "$examples"
+                return 0
+                ;;
+            l)
+                list_sessions
+                return 0
+                ;;
+            k)
+                local session_to_kill="$OPTARG"
+                if [[ "$session_to_kill" == "all" ]]; then
+                    if tmux_server_running; then
+                        tmux kill-server
+                        warn "Killed all sessions and server."
+                    else
+                        warn "staymux: No sessions to kill."
+                    fi
+                else
+                    if ! validate_session_name "$session_to_kill"; then
+                        return 1
+                    fi
+                    if get_sessions | grep -Fxq "$session_to_kill"; then
+                        env -u TMUX tmux kill-session -t "$session_to_kill"
+                        warn "Killed session '$session_to_kill'."
+                    else
+                        warn "staymux: No such session '$session_to_kill'."
+                        return 1
+                    fi
+                fi
+                return 0
+                ;;
+            \?)
+                warn "staymux: Invalid option: -$OPTARG"
+                info --no-pad "$help"
+                return 1
+                ;;
+            :)
+                # Proper handling of missing argument for -k.
+                warn "staymux: Option -$OPTARG requires an argument."
+                info --no-pad "$help"
+                return 1
+                ;;
+        esac
+    done
+    shift $((OPTIND - 1))
+
+    # ----- Main Action Logic -------------------------------------------------
+    # If already inside tmux, support session switching or show guidance.
+    if [[ -n "${TMUX:-}" ]]; then
+        if [[ $# -gt 0 ]]; then
+            local session_name="$1"
+            if ! validate_session_name "$session_name"; then
+                return 1
+            fi
+            switch_to_session "$session_name"
+            return 0
+        fi
+        warn --no-trailing "$nesting_msg"
+        list_sessions
+        return 0
+    fi
+
+    if [[ $# -gt 0 ]]; then
+        # User provided a session name.
+        local session_name="$1"
+        if ! validate_session_name "$session_name"; then
+            return 1
+        fi
+        # Single command to create or attach.
+        run_tmux_cmd new-session -As "$session_name"
+    else
+        # User did not provide a session name.
+        local active_sessions
+        mapfile -t active_sessions < <(get_sessions)
+        local count=${#active_sessions[@]}
+
+        if [[ $count -eq 0 ]]; then
+            # No sessions exist, create a default one.
+            local default_name
+            default_name=$(hostname -s)
+            run_tmux_cmd new-session -As "$default_name"
+        elif [[ $count -eq 1 ]]; then
+            # Exactly one session exists, attach to it.
+            tmux attach-session -t "${active_sessions[0]}"
+        else
+            # Multiple sessions exist, list them for the user to choose.
+            warn "Multiple sessions available. Please specify one."
+            list_sessions
+        fi
+    fi
+    return 0
+}
+
+# ----- Main Logic -------------------------------------------------------------
+setup_signal_handlers
+
+# Perform all checks before starting
+if ! check_os_version; then
+    exit 1
+fi
+
+if ! check_dependencies; then
+    exit 1
+fi
+
+ensure_not_root
+
+if ! check_systemd_user_availability; then
+    exit 1
+fi
+
+if ! enable_linger; then
+    exit 1
+fi
+
+staymux "$@"

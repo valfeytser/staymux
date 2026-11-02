@@ -1,0 +1,1614 @@
+#!/bin/bash
+# staymux - tmux sessions that survive logout, for unprivileged users on systemd hosts.
+#
+# A tmux server normally lives in the cgroup of the login that started it
+# (session-N.scope). It is killed when that login ends if logind kills session
+# processes (KillUserProcesses=yes, the upstream default; many distributions
+# ship "no"), or when an administrator terminates the session. A tmux 3.4+
+# built with systemd support also runs each pane in a scope of the user's
+# systemd manager, which stops at the last logout unless lingering is on.
+# staymux instead starts one private tmux server per user inside a transient
+# scope of the user's own systemd manager (systemd-run --user --scope, in
+# staymux.slice) and makes sure lingering is on, so that manager, the scope and
+# the server keep running after every login has ended.
+#
+# Needs bash 4.4+, tmux 2.7+, systemd 238+ (230+ on cgroup v1 hosts: older
+# releases cannot start a user scope from a login session on cgroup v2 or
+# hybrid hosts), util-linux (flock, setsid) and coreutils (timeout, mktemp,
+# cat, rm, id, ls, readlink).
+# Install as /usr/local/bin/staymux.
+
+set -u
+# Shell options can come in through an exported SHELLOPTS or BASHOPTS, or from
+# BASH_ENV. errexit would end the run at the first test that fails, noglob and
+# failglob would break the globs below (one that matches nothing must stay as
+# it is; the code checks for that), posix mode turns off process substitution
+# in bash before 5.1, keyword would turn "local a=1" into an environment
+# assignment, allexport would put our variables into every pane's
+# environment, nocasematch and nocaseglob would let session and file names
+# match regardless of case ("staymux -k work" could kill WORK), and
+# expand_aliases would let aliases from BASH_ENV change the commands below.
+# noclobber and xtrace are dealt with where they matter.
+set +o errexit +o noglob +o posix +o keyword +o allexport
+shopt -u failglob nocasematch nocaseglob expand_aliases
+
+readonly VERSION=1.0.0          # bump on each release; see CONTRIBUTING.md
+readonly SLICE=staymux.slice    # holds the server's scope and any per-pane scopes
+readonly LOCK_TIMEOUT=30        # seconds to wait for another staymux run
+SLICE_STOP_TIMEOUT=30           # seconds to wait for staymux.slice to stop; tests shorten it
+START_TIMEOUT=20                # seconds for a new server's config, below LOCK_TIMEOUT; tests shorten it
+PAUSE_SECONDS=5                 # seconds a warning stays visible before tmux covers it; tests shorten it
+JOBS_TIMEOUT=5                  # seconds for our user manager to list its jobs (see report_leftovers); tests shorten it
+readonly TMUX_TIMEOUT=10        # seconds to wait for a tmux client command
+# Where systemd keeps its cgroup tree: the name=systemd hierarchy on cgroup v1
+# and hybrid hosts, the unified one on cgroup v2 hosts. Tests point it at a
+# tree of their own.
+CGROUP_ROOTS=(/sys/fs/cgroup/systemd /sys/fs/cgroup/unified /sys/fs/cgroup)
+# The initial PID namespace, which the kernel always numbers the same
+# (PROC_PID_INIT_INO); tests stand their own in for it.
+INIT_PID_NS='pid:[4026531836]'
+LOCKED=0                        # 1 while this run holds the lock (see lock)
+WARNED=0                        # 1 once warn has printed, not note (see pause_after_warnings)
+
+# shellcheck disable=SC2016  # the help shows $XDG_RUNTIME_DIR literally
+usage() {
+    printf '%s\n' \
+'Usage: staymux [session]      Create or attach to a session.
+       staymux -l             List active sessions.
+       staymux -k <name|all>  Kill one session, or all sessions and the server.
+       staymux -h | --help    Show help.
+       staymux -V | --version Show the version.
+
+staymux keeps tmux sessions running after you log out. It runs one private
+tmux server per user in a systemd user scope (staymux.slice) and enables
+lingering for your account, so the server outlives every login.
+
+  staymux        No sessions: create one named after this host and attach.
+                 One session: attach to it. Several: list them.
+  staymux NAME   Attach to NAME, creating it first if needed.
+
+Inside a staymux session, "staymux NAME" switches to NAME (creating it if
+needed) and plain "staymux" lists the sessions, marking the current one.
+
+New session names may contain letters, digits, "_" and "-" (at most 64
+characters, not starting with "-"). "all" is reserved for -k.
+Exit status: 0 success, 1 error, 2 invalid usage.
+
+Direct tmux access, while the staymux server runs (-N needs tmux 3.2+):
+                     tmux -N -S "$XDG_RUNTIME_DIR/staymux.sock" ...
+Processes and units: systemctl --user status staymux.slice'
+}
+
+# Errors and notices go to stderr. The first argument says what happened; any
+# further arguments are indented lines saying what to run next.
+note() {
+    printf 'staymux: %s\n' "$1" >&2
+    shift
+    (($# == 0)) || printf '  %s\n' "$@" >&2
+}
+warn() { WARNED=1; note "$@"; }
+die() { warn "$@"; exit 1; }
+usage_error() { warn "$1" 'Run "staymux -h" for usage.'; exit 2; }
+
+check_requirements() {
+    local cmd missing=()
+    for cmd in tmux systemctl systemd-run loginctl flock setsid timeout mktemp; do
+        command -v "$cmd" >/dev/null || missing+=("$cmd")
+    done
+    ((${#missing[@]} == 0)) ||
+        die "missing command(s): ${missing[*]}." \
+            "staymux needs tmux, systemd (systemctl, systemd-run, loginctl), util-linux (flock, setsid) and coreutils (timeout, mktemp)." \
+            "Install the missing package, or ask an administrator to."
+    [[ -d /run/systemd/system ]] ||
+        die "this host is not running systemd, which staymux needs to keep tmux alive after logout." \
+            "Use plain tmux here instead."
+}
+
+# Work out who we are and where our files live. Everything is derived from the
+# UID: $USER, $HOME, $XDG_RUNTIME_DIR and $DBUS_SESSION_BUS_ADDRESS can be
+# stale after "su" or "sudo -u", and the last two are unset under cron.
+setup_environment() {
+    local dir home var
+    # Our name from the passwd database; the server and its panes inherit the
+    # exported values. Without a passwd entry, keep the inherited ones.
+    if ME=$(id -un 2>/dev/null) && [[ -n $ME ]]; then
+        export USER=$ME LOGNAME=$ME
+    else
+        ME="UID $EUID"
+    fi
+    # A $HOME that is not ours (left by "sudo -E" or "su -m") would give the
+    # server someone else's ~/.tmux.conf and the panes the wrong home. With
+    # HOME unset, bash expands ~ to our home directory from passwd.
+    if [[ ! -O ${HOME:-} ]]; then
+        home=$(unset HOME; printf '%s' ~)
+        [[ $home != /* ]] || export HOME=$home
+    fi
+    # Likewise the XDG folders: tmux 3.2 and later also read
+    # $XDG_CONFIG_HOME/tmux/tmux.conf, and plugins keep their files under the
+    # others (tmux-resurrect its saved sessions under $XDG_DATA_HOME). Without
+    # them, each falls back to its default under our home.
+    for var in XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME XDG_CACHE_HOME; do
+        [[ -z ${!var:-} || -O ${!var} ]] || unset "$var"
+    done
+
+    # logind always creates our runtime directory here, mode 0700, while our
+    # user manager runs; systemctl and systemd-run --user look for it there.
+    dir=/run/user/$EUID
+    if [[ ${XDG_RUNTIME_DIR:-} != "$dir" ]]; then
+        export XDG_RUNTIME_DIR=$dir
+        export DBUS_SESSION_BUS_ADDRESS=unix:path=$dir/bus
+    fi
+    SOCK=$dir/staymux.sock      # private: only we can enter $dir
+    LOCK=$dir/staymux.lock
+    STARTING=$dir/staymux.starting      # a server still starting (see wait_for_start)
+
+    # tmux starts a server on demand for commands such as new-session and
+    # attach-session. A server started that way would sit in this login's
+    # cgroup and can die at logout. tmux 3.2+ has -N ("never start a server")
+    # for client commands. Older tmux lacks it; there, -f /dev/null makes an
+    # accidental server load no config, so it exits at once unless it was given
+    # a session, which ensure_session catches.
+    if tmux -N -V >/dev/null 2>&1; then NO_START=(-N); else NO_START=(-f /dev/null); fi
+    fix_term
+
+    # PIDs read from /proc must be the ones that kill and $$ use. In a PID
+    # namespace without a /proc of its own they are not, and a signal meant
+    # for a server could reach another process.
+    [[ /proc/self -ef /proc/$$ ]] ||
+        die "/proc is missing here or belongs to another PID namespace, so staymux cannot tell which process is which." \
+            "Run staymux outside that namespace, or give it its own /proc (for example: unshare --mount-proc)."
+
+    # Inside tmux, $TMUX is "socket,pid,index", pid being the server's. It is
+    # split from the right, as the socket path may itself hold commas.
+    INSIDE=0 OTHER_TMUX='' TMUX_PID=''
+    if [[ -n ${TMUX:-} ]]; then
+        local sock=${TMUX%,*}
+        TMUX_PID=${sock##*,} sock=${sock%,*}
+        if [[ $sock == "$SOCK" || $sock -ef $SOCK ]]; then INSIDE=1; else OTHER_TMUX=$sock; fi
+    fi
+}
+
+# --- systemd -----------------------------------------------------------------
+
+linger_on() {
+    [[ $(loginctl show-user "$EUID" --property=Linger --value 2>/dev/null) == yes ]]
+}
+
+# Lingering keeps our user manager, and so the server's scope, running while we
+# have no login session. Returns 1 if it is off and could not be turned on.
+# The UID is passed explicitly: without an argument loginctl acts on the user
+# of the caller's login session, which after "su" or "sudo -u" is someone else.
+# Where site policy wants a password for it, loginctl enable-linger asks for one
+# through any polkit agent, its own or one already running, even with
+# --no-ask-password (it always calls SetUserLinger as interactive). Here that
+# holds the lock and comes back on every attach while lingering stays off, so
+# ask logind without interaction; the caller then says how to do it by hand.
+ensure_linger() {
+    linger_on && return 0
+    note "enabling lingering for $ME so that sessions survive logout (loginctl enable-linger $EUID)."
+    command -v busctl >/dev/null || { note "busctl (part of systemd) is missing, so staymux cannot enable lingering itself."; return 1; }
+    busctl --quiet --allow-interactive-authorization=no call org.freedesktop.login1 \
+        /org/freedesktop/login1 org.freedesktop.login1.Manager SetUserLinger ubb "$EUID" true false &&
+        linger_on
+}
+
+# Before a server starts, lingering must be on and our user manager reachable.
+# Right after enable-linger, logind is still starting user@UID.service, so wait
+# up to 10 seconds for it.
+prepare_systemd() {
+    ensure_linger ||
+        die "lingering is off for $ME, so a new server would be killed at logout, and staymux could not enable it." \
+            "Enable it with: loginctl enable-linger $EUID (it may ask for a password, and some sites allow it only from a local login)" \
+            "Or ask an administrator to run: sudo loginctl enable-linger $EUID" \
+            "Then run staymux again."
+    local i
+    for ((i = 0; i < 50; i++)); do
+        systemctl --user show --property=Version >/dev/null 2>&1 && return 0
+        read -rt 0.2 <> <(:)    # sleep 0.2 s using bash alone
+    done
+    die "cannot reach your systemd user manager (user@$EUID.service) through $XDG_RUNTIME_DIR." \
+        "Check it with: systemctl status user@$EUID.service" \
+        "If it is not running, ask an administrator to run: sudo systemctl start user@$EUID.service"
+}
+
+# Set QUEUED_JOBS to the jobs our user manager has queued, one "ID UNIT TYPE
+# STATE" line each: for units matching the patterns given after $1, or for
+# all units if none is given. Unit names come in full and without colour,
+# whatever COLUMNS or SYSTEMD_COLORS ask for. Fails if the manager cannot be
+# reached or does not answer within $1 seconds.
+list_jobs() {
+    local seconds=$1
+    shift
+    QUEUED_JOBS=$(SYSTEMD_COLORS=0 timeout "$seconds" systemctl --user list-jobs --no-legend --full "$@" 2>/dev/null)
+}
+
+# "staymux -k all" inside a session queues a stop of staymux.slice and exits,
+# letting go of the lock, and the slice takes until its stop timeout (90 s by
+# default) if a pane ignores SIGTERM and SIGHUP. Until it has stopped, systemd
+# refuses to start a scope in it and a server still in it is about to end, so
+# staymux [NAME] waits for that, up to SLICE_STOP_TIMEOUT seconds in all (one
+# more at most, as SECONDS counts whole seconds), each query bounded by the
+# time left. Once a stop has been seen, a query that fails does not end the
+# wait. If the first one fails there is no telling, and the run goes on as it
+# would have without this check.
+wait_for_slice_stop() {
+    local left seen=0 end=$((SECONDS + SLICE_STOP_TIMEOUT + 1))
+    while left=$((end - SECONDS)); ((left > 0)); do
+        if list_jobs "$left" "$SLICE"; then
+            [[ -n $QUEUED_JOBS ]] || return 0
+            ((seen)) || note "waiting for $SLICE to finish stopping."
+            seen=1
+        elif ((!seen)); then
+            return 0
+        fi
+        read -rt 0.2 <> <(:)    # sleep 0.2 s using bash alone
+    done
+    die "$SLICE is still stopping after ${SLICE_STOP_TIMEOUT}s." \
+        "See what it waits for with: systemctl --user list-jobs; systemctl --user status $SLICE" \
+        "Run staymux again once it has stopped."
+}
+
+# Set PID_CGROUP to the cgroup that systemd tracks PID $1 in: the cgroup v2
+# path ("0::..."), or the "name=systemd" path on cgroup v1 hosts such as
+# RHEL 8. Returns 1 if there is none, as when the process has exited.
+pid_cgroup() {
+    local line
+    PID_CGROUP=
+    while IFS= read -r line; do
+        case $line in
+            *:name=systemd:*) PID_CGROUP=${line#*:name=systemd:}; break ;;
+            0::*) PID_CGROUP=${line#0::} ;;
+        esac
+    done 2>/dev/null <"/proc/$1/cgroup"
+    # Read from another cgroup namespace (unshare --cgroup), the path is
+    # relative to that namespace's root: "/" or "/../...", which says nothing
+    # about the slice.
+    [[ $PID_CGROUP != / && $PID_CGROUP != /.. && $PID_CGROUP != /../* ]] || PID_CGROUP=''
+    [[ -n $PID_CGROUP ]]
+}
+
+# True if the server runs in staymux.slice under our user manager. Anywhere
+# else, typically session-N.scope, it can be killed at logout (see the header).
+server_in_slice() {
+    pid_cgroup "${SERVER_PID:-0}"
+    SERVER_CGROUP=$PID_CGROUP
+    [[ $SERVER_CGROUP == */user@"$EUID".service/"$SLICE"/* ]]
+}
+
+# Set SLICE_PIDS to the processes in staymux.slice other than this one, indexed
+# by PID, each with the unit it runs in (the slice itself for one directly in
+# it). They come from the cgroup.procs files of the slice and every cgroup
+# below it, which costs the same however busy the host is.
+slice_pids() {
+    local root dir cur sub unit pid queue=()
+    SLICE_PIDS=()
+    for root in "${CGROUP_ROOTS[@]}"; do
+        dir=$root/user.slice/user-$EUID.slice/user@$EUID.service/$SLICE
+        [[ -d $dir ]] || continue
+        queue=("$dir")
+        while ((${#queue[@]})); do
+            cur=${queue[-1]}
+            unset 'queue[-1]'
+            for sub in "$cur"/*/; do
+                [[ ! -d $sub ]] || queue+=("${sub%/}")
+            done
+            unit=$SLICE
+            if [[ $cur != "$dir" ]]; then
+                unit=${cur#"$dir"/}
+                unit=${unit%%/*}
+            fi
+            while read -r pid; do
+                [[ $pid == "$$" ]] || SLICE_PIDS[pid]=$unit
+            done 2>/dev/null <"$cur/cgroup.procs"
+        done
+        return 0
+    done
+}
+
+# Set SOCK_INODES to the inodes of the listening sockets bound to $SOCK. The
+# kernel lists a socket under the path it was bound to (/proc/net/unix) even
+# after its file has been removed or replaced, so this finds every tmux server
+# started on $SOCK, whether a client can reach it or not.
+listening_inodes() {
+    local line lines=() num refs proto flags type state inode path
+    SOCK_INODES=()
+    # In one go: read would take the file, often thousands of lines, a byte
+    # at a time.
+    mapfile -t lines 2>/dev/null </proc/net/unix
+    for line in "${lines[@]}"; do
+        [[ $line == *" $SOCK" ]] || continue
+        # shellcheck disable=SC2034  # names every field of the line; only some are used
+        read -r num refs proto flags type state inode path <<<"$line"
+        if [[ $path == "$SOCK" && $flags == 00010000 ]]; then
+            SOCK_INODES+=("$inode")
+        fi
+    done
+}
+
+# Set HOLDERS to our tmux servers for $SOCK that hold one of SOCK_INODES.
+# ls shows where each descriptor link points without following it, so
+# a descriptor on a hung network file system cannot block this. It gets one
+# directory per process of ours, not one path per descriptor, in batches that
+# stay well within the size limit of a command line; with /dev/null as an
+# extra operand it always heads each directory's listing with "/proc/PID/fd:".
+# The escape quoting style prints a newline or space in a file name as \n or
+# "\ ", and --time-style overrides any TIME_STYLE, so no file name or date can
+# pass for such a header or for a socket entry. A child that a server has just
+# forked (a new pane, a #() job) holds the socket too until it runs its
+# program, and a signal meant for the server would kill it, so a holder whose
+# parent is also an accepted server is left out.
+socket_holders() {
+    local dir dirs=() i line lines=() pid='' inode key value own_links=0
+    local -A wanted=() held_pids=() parent=() accepted=()
+    HOLDERS=()
+    ((${#SOCK_INODES[@]})) || return 0
+    for inode in "${SOCK_INODES[@]}"; do
+        wanted[$inode]=1
+    done
+    for dir in /proc/[0-9]*; do
+        [[ ! -O $dir ]] || dirs+=("$dir/fd")
+    done
+    for ((i = 0; i < ${#dirs[@]}; i += 1000)); do
+        mapfile -t -O "${#lines[@]}" lines < <(LC_ALL=C ls -ln --quoting-style=escape \
+            --time-style=long-iso -- /dev/null "${dirs[@]:i:1000}" 2>/dev/null)
+    done
+    for line in "${lines[@]}"; do
+        if [[ $line == /proc/*/fd: ]]; then
+            pid=${line#/proc/}
+            pid=${pid%/fd:}
+            [[ $pid != *[!0123456789]* ]] || pid=''
+            continue
+        fi
+        [[ $pid != "$$" || $line != *" -> "* ]] || own_links=1
+        [[ -n $pid && $line == *" -> socket:["*"]" ]] || continue
+        inode=${line##*" -> socket:["}
+        inode=${inode%]}
+        [[ -z ${wanted[$inode]:-} ]] || held_pids[$pid]=1
+    done
+    for pid in "${!held_pids[@]}"; do
+        same_place "$pid" || continue
+        is_our_server "$pid" || continue
+        accepted[$pid]=1
+        while read -r key value; do
+            if [[ $key == PPid: ]]; then parent[$pid]=$value; break; fi
+        done 2>/dev/null <"/proc/$pid/status"
+    done
+    for pid in "${!accepted[@]}"; do
+        [[ -z ${accepted[${parent[$pid]:-0}]:-} ]] || continue
+        HOLDERS+=("$pid")
+    done
+    # Our own descriptor directory is always among them, with links such as
+    # "0 -> /dev/pts/1", so none found there means an ls whose output this
+    # does not understand. Say so rather than act as if no server held the
+    # socket.
+    if ((!own_links)); then
+        HOLDERS=()
+        warn "cannot tell from ls which process holds $SOCK, so a tmux server that lost its socket cannot be found." \
+            "Check for one with: pgrep -u $EUID -a tmux"
+    fi
+}
+
+# True if process $1 sees the directory of $SOCK as the one this run sees, or
+# if that cannot be told. /proc/net/unix lists the sockets of the whole
+# network namespace, so another mount namespace sharing it (a container
+# with host networking, another WSL distribution) can have a socket bound
+# to the same path, in a directory of its own. Its server is not ours.
+# Likewise a socket whose holder is not visible here at all is left alone.
+same_place() {
+    local dir=${SOCK%/*}
+    [[ $dir == /* ]] || dir=$PWD/$dir
+    [[ ! -e /proc/$1/root/ || /proc/$1/root$dir -ef $dir ]]
+}
+
+# Only our tmux server for $SOCK makes the socket again on SIGUSR1;
+# tmux clients ignore it and other programs die of it. The name comes first, as
+# reading a command line can wait on the process. A server's command line is
+# that of the client that started it (tmux -S $SOCK new-session ...), unless
+# its title replaced it (tmux: server ($SOCK)). Only tmux's own options, up to
+# the command, name its socket, and of several -S the last counts; $SOCK as a
+# session name or in a pane's command, such as a nested tmux -S $SOCK attach,
+# does not.
+is_our_server() {
+    local comm='' i arg value path='' args=()
+    IFS= read -r comm 2>/dev/null <"/proc/$1/comm" || return 1
+    [[ $comm == tmux || $comm == 'tmux: server' ]] || return 1
+    mapfile -d '' -t args 2>/dev/null <"/proc/$1/cmdline" || return 1
+    [[ ${args[0]:-} != "tmux: server ($SOCK)" ]] || return 0
+    [[ $comm == 'tmux: server' ]] || return 1
+    for ((i = 1; i < ${#args[@]}; i++)); do
+        arg=${args[i]}
+        [[ $arg == -?* && $arg != -- ]] || break
+        [[ $arg =~ ^-[^cfLST]*([cfLST])(.*)$ ]] || continue
+        value=${BASH_REMATCH[2]}
+        [[ -n $value ]] || value=${args[++i]:-}
+        [[ ${BASH_REMATCH[1]} != S ]] || path=$value
+    done
+    [[ $path == "$SOCK" ]]
+}
+
+# Return 0 if process $1, a tmux of ours that runs, holds a socket bound to
+# $SOCK, 1 if it does not, and 2 if that cannot be told: ls gives nothing this
+# understands (see socket_holders), or $1 is not visible here and this run is
+# not in the initial PID namespace.
+holds_socket() {
+    local line inode links=0 lines=()
+    all_digits "$1" || return 1
+    if [[ ! -e /proc/$1 ]]; then
+        # Not visible here. In the initial PID namespace every process is, so
+        # $1 has gone. In any other (a container, a sandbox started from a
+        # pane), $1 may be our server, outside it. Sockets listed for $SOCK
+        # cannot tell: another user can forge a line of /proc/net/unix, or
+        # bind a socket to the same path in a mount namespace of their own.
+        [[ $(readlink /proc/self/ns/pid 2>/dev/null) == "$INIT_PID_NS" ]] || return 2
+        return 1
+    fi
+    [[ -O /proc/$1 ]] || return 1
+    running "$1" || return 1
+    is_our_server "$1" || return 1
+    same_place "$1" || return 1
+    listening_inodes
+    ((${#SOCK_INODES[@]})) || return 1
+    mapfile -t lines < <(LC_ALL=C ls -ln --quoting-style=escape --time-style=long-iso -- "/proc/$1/fd" 2>/dev/null)
+    for line in "${lines[@]}"; do
+        [[ $line == *" -> "* ]] || continue
+        links=1
+        [[ $line == *" -> socket:["*"]" ]] || continue
+        inode=${line##*" -> socket:["}
+        inode=${inode%]}
+        [[ " ${SOCK_INODES[*]} " != *" $inode "* ]] || return 0
+    done
+    ((links)) || return 2
+    return 1
+}
+
+# A server whose socket file was removed, or replaced by a stale one, keeps
+# running with its sessions, but no client can reach it, and staymux would
+# start a second server beside it. SIGUSR1 makes tmux create its socket again.
+# Called when no server answers, so every server bound to $SOCK is such a one,
+# in staymux.slice or not. Only one is signalled, and set in REVIVED: several
+# would race for the socket, and the losers stay hidden (report_hidden_servers
+# names them). load_sessions calls this again only once that one has exited,
+# never while it may still act on the signal; each call takes one not tried
+# before in this load_sessions (REVIVE_TRIED). A stopped server, or one with a
+# SIGUSR1 pending, comes first, even ahead of a healthy one: a server that an
+# earlier run gave up on is usually stopped with the signal still to act on,
+# and once resumed it would take the socket from any server revived before it.
+# Holding the others back until it is resumed or ended (the error says how) is
+# the safe choice. Next come those in staymux.slice, then the rest. A server
+# with a signal pending that ends it (see proc_status) is passed over unless
+# SIGUSR1 is pending too, as the signal would only make it take the socket
+# before it ends. It is listed in ENDING instead, and load_sessions gives up
+# if only such servers are left. Only a run that holds the lock does this, so
+# that the signal cannot hit a server that another run is starting. Returns
+# 1 if there is none left.
+revive_server() {
+    local pid pending=() inside=() outside=()
+    REVIVED='' ENDING=()
+    ((LOCKED)) || return 1
+    listening_inodes
+    socket_holders
+    for pid in "${HOLDERS[@]}"; do
+        [[ -z ${REVIVE_TRIED[pid]:-} ]] || continue
+        proc_status "$pid" || continue
+        if ((PUSR1)); then
+            pending+=("$pid")
+        elif ((PEXIT)); then
+            ENDING+=("$pid")
+        elif [[ $PSTATE == [Tt] ]]; then
+            pending+=("$pid")
+        elif pid_cgroup "$pid" && [[ $PID_CGROUP == */user@"$EUID".service/"$SLICE"/* ]]; then
+            inside+=("$pid")
+        else
+            outside+=("$pid")
+        fi
+    done
+    for pid in "${pending[@]}" "${inside[@]}" "${outside[@]}"; do
+        REVIVE_TRIED[pid]=1
+        if kill -USR1 "$pid" 2>/dev/null; then
+            REVIVED=$pid
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Set PSTATE to the state of process $1 (R, S, D, T stopped, t stopped by a
+# debugger, Z zombie, ...), PUSR1 to 1 if a SIGUSR1 is pending for it, and
+# PEXIT to the lowest pending signal that ends a tmux server once it runs, or
+# 0. Which signals do that differs between tmux versions (3.2 and later ignore
+# SIGQUIT and exit on SIGINT; older ones ignore SIGINT and dump core on
+# SIGQUIT), so the server's own dispositions decide. An ignored signal does
+# nothing, even when it is queued (while blocked, or under a debugger). Of
+# those tmux catches, SIGINT and SIGTERM make it exit, and it acts on or
+# outlives the rest. Any other signal ends it, except those that by default
+# are ignored, stop or continue the process. Signal N is bit N-1 of each mask
+# (Linux numbering, as on x86 and ARM). Returns 1 if it has gone.
+proc_status() {
+    local key value n sigs=0 ign=0 cgt=0 harmless=0
+    PSTATE='' PUSR1=0 PEXIT=0
+    kill -0 "$1" 2>/dev/null || return 1
+    while read -r key value; do
+        case $key in
+            State:) PSTATE=${value:0:1} ;;
+            SigPnd: | ShdPnd:) ((sigs |= 16#$value)) ;;
+            SigIgn:) ((ign = 16#$value)) ;;
+            SigCgt:) ((cgt = 16#$value)) ;;
+        esac
+    done 2>/dev/null <"/proc/$1/status"
+    (((sigs & 1 << 9) == 0)) || PUSR1=1    # SIGUSR1 is 10
+    for n in 17 18 19 20 21 22 23 28; do    # SIGCHLD SIGCONT SIGSTOP SIGTSTP SIGTTIN SIGTTOU SIGURG SIGWINCH
+        ((harmless |= 1 << (n - 1)))
+    done
+    ((sigs &= ~ign & ~harmless & (~cgt | 1 << 1 | 1 << 14)))    # SIGINT is 2, SIGTERM 15
+    for ((n = 1; sigs && n <= 64; n++)); do
+        if (((sigs >> (n - 1)) & 1)); then
+            PEXIT=$n
+            break
+        fi
+    done
+    [[ -n $PSTATE ]]    # empty: it went while being read
+}
+
+# Print the pending signals that proc_status found, as "SIGUSR1 and SIGTERM".
+pending_signals() {
+    local name sigs=()
+    ((!PUSR1)) || sigs+=(SIGUSR1)
+    if ((PEXIT)); then
+        name=$(kill -l "$PEXIT" 2>/dev/null)    # none for 32 and 33, which glibc keeps for itself
+        sigs+=("${name:+SIG}${name:-signal $PEXIT}")
+    fi
+    if ((${#sigs[@]} == 2)); then
+        printf '%s and %s' "${sigs[@]}"
+    elif ((${#sigs[@]})); then
+        printf '%s' "${sigs[0]}"
+    fi
+}
+
+# Set ADVICE to what to do about server $1, for which proc_status has just
+# found a pending signal that ends it (PEXIT): only SIGKILL keeps it from
+# acting on SIGUSR1 first, if that is pending too.
+ending_advice() {
+    local sigs effect='ends with its sessions'
+    sigs=$(pending_signals)
+    ((!PUSR1)) || effect+=', perhaps taking the socket first'
+    case $PSTATE in
+        T) ADVICE=("PID $1 is stopped with $sigs pending: once resumed, it $effect.") ;;
+        t) ADVICE=("PID $1 is stopped by a debugger with $sigs pending: once let go, it $effect.") ;;
+        *) ADVICE=("PID $1 has $sigs pending: as soon as it runs, it $effect.") ;;
+    esac
+    ADVICE+=("To end it now: kill -KILL $1")
+}
+
+# True if process $1 still runs: kill -0 also succeeds on a zombie.
+running() { proc_status "$1" && [[ $PSTATE != Z ]]; }
+
+# Set START_TIME to when process $1 started (clock ticks since boot, field 22
+# of /proc/PID/stat, counted after the command name, which can hold spaces).
+proc_start() {
+    local line fields=()
+    START_TIME=''
+    read -r line 2>/dev/null <"/proc/$1/stat" || return 1
+    read -ra fields <<<"${line##*) }"
+    START_TIME=${fields[19]:-}
+    all_digits "$START_TIME"
+}
+
+# Processes left in staymux.slice by an earlier server (programs that outlived
+# its crash, or a tmux server bound elsewhere) keep running beside a new one,
+# until "staymux -k all". They may be wanted, started with nohup for example,
+# so say where they are rather than stop them. Only with the lock: otherwise
+# the scope of a server that another run is starting would be listed. While
+# a stop is queued for the slice (see wait_for_slice_stop) or for a unit in
+# it (as the advice below has the user run), the processes it covers are
+# being ended, not left. The processes are read again once the jobs are
+# known, so that a stop finishing in between leaves none to count. A manager
+# that does not answer within JOBS_TIMEOUT counts as having none queued.
+report_leftovers() {
+    local pid unit id type rest left=0 ending=0 units=()
+    local -A seen=() stopping=()
+    ((LOCKED)) || return 0
+    slice_pids
+    ((${#SLICE_PIDS[@]})) || return 0
+    if list_jobs "$JOBS_TIMEOUT"; then
+        while read -r id unit type rest; do
+            [[ $type != stop ]] || stopping[$unit]=1
+        done <<<"$QUEUED_JOBS"
+        slice_pids
+    fi
+    for pid in "${!SLICE_PIDS[@]}"; do
+        unit=${SLICE_PIDS[pid]}
+        if [[ -n ${stopping[$SLICE]:-} || -n ${stopping[$unit]:-} ]]; then
+            ((++ending))
+            continue
+        fi
+        ((++left))
+        [[ -n ${seen[$unit]:-} ]] || units+=("$unit")
+        seen[$unit]=1
+    done
+    ((!ending)) || note "$ending process(es) in $SLICE are still being stopped."
+    ((left)) || return 0
+    warn "$left process(es) left by an earlier staymux server still run in $SLICE." \
+        "See them with: systemctl --user status ${units[*]}" \
+        "Stop them with: systemctl --user stop ${units[*]}"
+}
+
+# A second tmux server bound to $SOCK, which lost the socket to the one that
+# answers, runs on with sessions that no client can reach. Say so; which
+# server's sessions matter is for the user to decide.
+report_hidden_servers() {
+    local pid others=() running=() lines=()
+    [[ -n $SERVER_PID ]] || return 0    # without it, the answering server cannot be told apart
+    listening_inodes
+    ((${#SOCK_INODES[@]} > 1)) || return 0
+    socket_holders
+    # Advice by state: a stopped server acts on its pending signals only once
+    # resumed, and ends at once only with SIGKILL.
+    for pid in "${HOLDERS[@]}"; do
+        [[ $pid != "$SERVER_PID" ]] || continue
+        running "$pid" || continue    # it has ended since
+        others+=("$pid")
+        if ((PEXIT)); then
+            ending_advice "$pid"
+            lines+=("${ADVICE[@]}")
+            continue
+        fi
+        case $PSTATE in
+            T)  if ((PUSR1)); then
+                    lines+=("PID $pid is stopped with SIGUSR1 pending: once resumed (kill -CONT $pid), it takes the socket back.")
+                else
+                    lines+=("PID $pid is stopped: to reach its sessions, resume it and give it the socket back: kill -CONT $pid; kill -USR1 $pid")
+                fi
+                lines+=("To stop PID $pid and its sessions: kill -KILL $pid") ;;
+            t)  if ((PUSR1)); then
+                    lines+=("PID $pid is stopped by a debugger with SIGUSR1 pending: once let go, it takes the socket back.")
+                else
+                    lines+=("PID $pid is stopped by a debugger: it acts on signals only once the debugger lets it go.")
+                fi
+                lines+=("To stop PID $pid and its sessions: kill -KILL $pid") ;;
+            *)  running+=("$pid") ;;
+        esac
+    done
+    ((${#others[@]})) || return 0
+    if ((${#running[@]} == 1)); then
+        lines=("To reach the sessions of PID ${running[0]} instead of this server's, give it the socket back: kill -USR1 ${running[0]}"
+               "To stop PID ${running[0]} and its sessions: kill ${running[0]}" "${lines[@]}")
+    elif ((${#running[@]})); then
+        # Only one server can have the socket, so it goes back to one at a time.
+        lines=("To reach the sessions of one of PID ${running[*]} instead of this server's, give that one the socket back: kill -USR1 PID"
+               "To stop them and their sessions: kill ${running[*]}" "${lines[@]}")
+    fi
+    if ((${#others[@]} == 1)); then
+        warn "another tmux server (PID ${others[0]}) lost $SOCK to this one (PID $SERVER_PID); no client can reach its sessions." "${lines[@]}"
+    else
+        warn "other tmux servers (PID ${others[*]}) lost $SOCK to this one (PID $SERVER_PID); no client can reach their sessions." "${lines[@]}"
+    fi
+}
+
+# True if the server SERVER_PID has gone: no process of that PID here, and no
+# answer from it on $SOCK either (outside a PID namespace that this runs in,
+# its process is not visible).
+server_gone() {
+    ! running "$SERVER_PID" &&
+        ! { tmx_capture display-message -p '#{pid}' && [[ $TMX_OUT == "$SERVER_PID" ]]; }
+}
+
+require_server_in_slice() {
+    server_in_slice && return 0
+    # Without a cgroup that says where it runs (its process is not visible
+    # here, as in a container or sandbox), replacing the server would end its
+    # sessions for nothing.
+    if [[ -z $SERVER_CGROUP ]]; then
+        [[ -z $SERVER_PID ]] || ! server_gone ||
+            die "the staymux tmux server (PID $SERVER_PID) exited while it was being checked." \
+                "Run staymux again. If this keeps happening, check ~/.tmux.conf and your shell (default-command)."
+        die "cannot tell which cgroup the staymux tmux server (PID ${SERVER_PID:-unknown}) runs in, so cannot check that it runs in $SLICE and outlives logout." \
+            "If this runs in a container or sandbox, run staymux outside it."
+    fi
+    die "the staymux tmux server (PID ${SERVER_PID:-unknown}) runs in $SERVER_CGROUP, outside $SLICE, so it may be killed when you log out." \
+        "To reach its sessions anyway: tmux -S $SOCK attach" \
+        "To replace it with a persistent server, save your work and run: staymux -k all; staymux"
+}
+
+# --- tmux --------------------------------------------------------------------
+
+# A tmux client command on our socket, given up after TMUX_TIMEOUT seconds so
+# that a hung server cannot block staymux while it holds the lock. Commands
+# whose output staymux reads go through tmx_capture. The lock on fd 9 is never
+# handed to a server. With tmux 3.2+ (-N) the command can never
+# start a server; with older tmux, new-session can start one, so its caller
+# must check SERVER_PID afterwards (see ensure_session). -u keeps tabs and
+# UTF-8 in the output intact when the locale is not UTF-8 (cron, env -i); tmux
+# would print "_".
+tmx() { timeout --foreground "$TMUX_TIMEOUT" tmux -u -S "$SOCK" "${NO_START[@]}" "$@" 9>&-; }
+
+# Run tmx with its output (stdout and stderr, without the final newline) in
+# TMX_OUT, and return its status. The output goes to a file, not a pipe as
+# with $(...): tmux hands the client's stdout to the server, so a hung server
+# would hold a pipe open and block staymux even after the client has been
+# timed out. The file is unlinked at once; one left by a run killed before
+# that is removed by the next run.
+tmx_capture() {
+    local file pid wfd='' rfd='' rc=0
+    TMX_OUT='' TMX_LOCAL=0      # TMX_LOCAL: the failure is staymux's own, not tmux's
+    # The file name carries our PID. A run killed between mktemp and rm below
+    # leaves its file behind; remove those of runs that have ended.
+    for file in "$XDG_RUNTIME_DIR"/staymux.*.??????; do
+        pid=${file#"$XDG_RUNTIME_DIR"/staymux.}
+        pid=${pid%.*}
+        [[ -f $file && -n $pid && $pid != *[!0123456789]* && ! -e /proc/$pid ]] || continue
+        rm -f -- "$file"
+    done
+    if ! file=$(mktemp "$XDG_RUNTIME_DIR/staymux.$$.XXXXXX" 2>/dev/null); then
+        TMX_OUT="cannot create a temporary file in $XDG_RUNTIME_DIR" TMX_LOCAL=1
+        return 1
+    fi
+    # ">|" because mktemp has created the file, and a noclobber inherited
+    # through an exported SHELLOPTS would refuse ">".
+    # shellcheck disable=SC2094  # one descriptor writes, a separate one reads from the start
+    if ! { exec {wfd}>|"$file" {rfd}<"$file"; } 2>/dev/null; then
+        rm -f -- "$file"
+        [[ -z $wfd ]] || exec {wfd}>&-
+        TMX_OUT="cannot open a temporary file in $XDG_RUNTIME_DIR" TMX_LOCAL=1
+        return 1
+    fi
+    rm -f -- "$file"
+    # xtrace (inherited, or bash -x for debugging) would write the trace of the
+    # commands in tmx into the output; trace around it instead.
+    if [[ $- == *x* ]]; then
+        set +x
+        tmx "$@" >&"$wfd" 2>&1 || rc=$?
+        set -x
+    else
+        tmx "$@" >&"$wfd" 2>&1 || rc=$?
+    fi
+    IFS= read -r -d '' TMX_OUT <&"$rfd"
+    exec {wfd}>&- {rfd}<&-
+    TMX_OUT=${TMX_OUT%$'\n'}
+    return "$rc"
+}
+
+# Read the server's sessions into the S_* arrays and its PID into SERVER_PID.
+# Returns 0 if a server answered, and 1 if none is running, which includes a
+# stale socket left by a crashed server: tmux replaces that socket when it
+# starts the next server, and a server that is just exiting. A server that
+# lost its socket is revived first (see revive_server). Anything else
+# (access denied, no answer, a revived server that does not answer, only
+# servers left that a pending signal ends, another tmux error) ends the run
+# through die_load_error. With --soft it returns 2 instead, with the reason
+# in LOAD_ERROR, tmux's status in LOAD_RC (124: no answer), LOAD_STUCK set
+# for a revived server that does not answer, LOAD_ENDING set when only
+# servers that a pending signal ends are left (in ENDING), and LOAD_LOCAL set
+# if staymux itself failed (full runtime directory): kill_all can then still
+# stop the slice, cmd_kill only reports it, and main ends the run itself
+# unless the action is -k all.
+load_sessions() {
+    local rc line marker mark pid id windows clients created rest waits=0 stuck=0 ending=0
+    S_ID=() S_NAME=() S_WINDOWS=() S_CLIENTS=() S_CREATED=()
+    REVIVED='' REVIVE_TRIED=() ENDING=()
+    SERVER_UP=0 SERVER_PID='' LOAD_ERROR='' LOAD_RC=0 LOAD_LOCAL=0 LOAD_STUCK=0 LOAD_ENDING=0
+    # No runtime directory: no user manager, so no server either.
+    [[ -d $XDG_RUNTIME_DIR ]] || return 1
+    # One line per session, its fields separated by ":". The name goes last,
+    # so it comes through verbatim, with any ":", tabs or spaces in it. It can
+    # even hold a newline (older tmux allows one, and newer tmux keeps one in
+    # the names it makes from a session group's name, GROUP-N); the rest of
+    # the name then follows on the next lines. So that no part of a name can
+    # pass for a session's line, each such line starts with a marker made
+    # afresh for this call. An error is classified from this same call; tmux
+    # sets only LC_CTYPE and LC_TIME, so the system error text in it is never
+    # translated. A server that exits while answering gives "server exited",
+    # "server exited unexpectedly" or, on older tmux, "lost server".
+    marker=''
+    read -r marker 2>/dev/null </proc/sys/kernel/random/uuid
+    [[ -n $marker ]] || printf -v marker '%04x%04x%04x%04x' "$RANDOM" "$RANDOM" "$RANDOM" "$RANDOM"
+    while :; do
+        rc=0
+        tmx_capture list-sessions -F "$marker:#{pid}:#{session_id}:#{session_windows}:#{session_attached}:#{session_created}:#{session_name}" || rc=$?
+        ((rc != 0)) || break
+        case $TMX_OUT in
+            "server exited"* | "lost server"*) return 1 ;;
+            "no server running on "* | "error connecting to "*"(No such file or directory)"*)
+                # No socket, or a stale one. A server that lost its socket gets
+                # as long to answer as any tmux command. If it exits meanwhile
+                # (after its last session was killed, say), the next one is
+                # tried. One that still runs is not given up for another: with
+                # the signal pending it could take the socket from that one at
+                # any moment, even in the middle of this run.
+                stuck=0
+                if [[ -n $REVIVED ]] && running "$REVIVED"; then
+                    # Waits are counted, not timed, as the clock can be set
+                    # forwards or back meanwhile; each takes at least 0.1 s.
+                    ((++waits <= TMUX_TIMEOUT * 10)) || stuck=1
+                elif revive_server; then
+                    waits=0
+                elif ((${#ENDING[@]})); then
+                    # They still hold the socket's address; a new server
+                    # beside them would leave their sessions unmentioned.
+                    ending=1
+                else
+                    return 1    # none, or all have exited: no server
+                fi
+                if ((!stuck && !ending)); then
+                    read -rt 0.1 <> <(:)
+                    continue
+                fi ;;
+        esac
+        LOAD_RC=$rc LOAD_LOCAL=$TMX_LOCAL LOAD_STUCK=$stuck LOAD_ENDING=$ending
+        if ((stuck)); then
+            # A server that still has the signal pending would take the
+            # socket from a new one, so treat it as one that does not answer.
+            LOAD_RC=124
+            LOAD_ERROR="PID $REVIVED lost the socket and did not create it again within ${TMUX_TIMEOUT}s"
+        elif ((ending)); then
+            LOAD_RC=124
+            if ((${#ENDING[@]} == 1)); then
+                LOAD_ERROR="PID ${ENDING[0]} lost the socket and has a signal pending that ends it once it runs"
+            else
+                LOAD_ERROR="PID ${ENDING[*]} lost the socket and have signals pending that end them once they run"
+            fi
+        elif ((rc == 124)); then
+            LOAD_ERROR="no answer within ${TMUX_TIMEOUT}s"
+        else
+            LOAD_ERROR=${TMX_OUT:-tmux exited with status $rc}
+        fi
+        [[ ${1:-} != --soft ]] || return 2
+        die_load_error
+    done
+    SERVER_UP=1
+    while IFS= read -r line; do
+        IFS=: read -r mark pid id windows clients created rest <<<"$line"
+        if [[ $mark == "$marker" && $id == '$'?* ]] &&
+            all_digits "$pid" "${id#'$'}" "$windows" "$clients" "$created"; then
+            SERVER_PID=$pid
+            # The name is the rest of the line as it is; read would drop a
+            # trailing ":" from it.
+            S_ID+=("$id") S_NAME+=("${line#*:*:*:*:*:*:}") S_WINDOWS+=("$windows") S_CLIENTS+=("$clients") S_CREATED+=("$created")
+        elif ((${#S_ID[@]})); then
+            S_NAME[-1]+=$'\n'$line
+        fi
+    done <<<"$TMX_OUT"
+    # A server kept alive without sessions (exit-empty off) lists nothing.
+    if [[ -z $SERVER_PID ]] && tmx_capture display-message -p '#{pid}' && all_digits "$TMX_OUT"; then
+        SERVER_PID=$TMX_OUT
+    fi
+    # Named from the answer: a server tried earlier can be the one that came back.
+    ((${#REVIVE_TRIED[@]} == 0)) ||
+        warn "the tmux server (PID ${SERVER_PID:-unknown}) had lost its socket $SOCK and has created it again."
+    return 0
+}
+
+# End the run with the error that load_sessions found (with --soft, it
+# returns 2 instead of calling this).
+die_load_error() {
+    local pid waiting=() first=() hints=() status_cmd
+    if ((LOAD_STUCK || LOAD_ENDING)); then
+        # Advice for each server that a pending signal ends. When one was
+        # revived, the rest wait for it.
+        for pid in "${HOLDERS[@]}"; do
+            [[ $pid != "$REVIVED" ]] || continue
+            running "$pid" || continue
+            if ((PEXIT)); then
+                ending_advice "$pid"
+                hints+=("${ADVICE[@]}")
+            else
+                waiting+=("$pid")
+            fi
+        done
+    fi
+    if ((LOAD_STUCK)); then
+        proc_status "$REVIVED"
+        if ((PEXIT)); then
+            ending_advice "$REVIVED"
+            first=("${ADVICE[@]}")
+        else
+            case $PSTATE in
+                T) first=("It is stopped. Resume it, and it creates its socket again: kill -CONT $REVIVED") ;;
+                t) first=("It is stopped by a debugger. Detach the debugger, and it creates its socket again."
+                          "Or end it, losing its sessions: kill -KILL $REVIVED") ;;
+                *) # Its unit is in our user manager, or a login session's scope.
+                   status_cmd="systemctl status $REVIVED"
+                   ! pid_cgroup "$REVIVED" || [[ $PID_CGROUP != */user@"$EUID".service/* ]] ||
+                       status_cmd="systemctl --user status $REVIVED"
+                   first=("It may be hung, or frozen with its unit (check: $status_cmd)."
+                          "If it does not come back, end it, losing its sessions: kill -KILL $REVIVED") ;;
+            esac
+        fi
+        ((${#waiting[@]} == 0)) ||
+            first+=("Other tmux servers that lost the socket (PID ${waiting[*]}) are tried once PID $REVIVED has ended.")
+        die "the tmux server (PID $REVIVED) lost its socket $SOCK and has not created it again within ${TMUX_TIMEOUT}s." \
+            "${first[@]}" "${hints[@]}" "Then run staymux again."
+    fi
+    if ((LOAD_ENDING)); then
+        if ((${#ENDING[@]} == 1)); then
+            die "the tmux server (PID ${ENDING[0]}) lost its socket $SOCK and has a signal pending that ends it." \
+                "${hints[@]}" "Then run staymux again."
+        fi
+        die "the tmux servers (PID ${ENDING[*]}) lost their socket $SOCK and have signals pending that end them." \
+            "${hints[@]}" "Then run staymux again."
+    fi
+    if ((LOAD_RC == 124)); then
+        die "the staymux tmux server does not answer ($LOAD_ERROR)." \
+            "To stop the server and all its sessions, run: staymux -k all"
+    fi
+    ((!LOAD_LOCAL)) ||
+        die "$LOAD_ERROR." "Check the free space in $XDG_RUNTIME_DIR: df -h $XDG_RUNTIME_DIR"
+    die "could not query the staymux tmux server: $LOAD_ERROR" \
+        "Check that $XDG_RUNTIME_DIR and $SOCK belong to you." \
+        "To stop the server and all its sessions anyway, run: staymux -k all"
+}
+
+# True if every argument is a non-empty run of ASCII digits.
+all_digits() {
+    local arg
+    for arg; do
+        [[ -n $arg && $arg != *[!0123456789]* ]] || return 1
+    done
+}
+
+# Print the id ($N) of the session named exactly $1. Names are compared here,
+# not by tmux: "-t NAME" would match prefixes and patterns and give "$", "=",
+# ":" and "." special meanings. Session ids are unambiguous.
+session_id() {
+    local i
+    for i in "${!S_NAME[@]}"; do
+        if [[ ${S_NAME[i]} == "$1" ]]; then
+            printf '%s\n' "${S_ID[i]}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# New session names are plain words. tmux would expand "#" as a format, turn
+# "." and ":" into "_", and treat a trailing ";" as a command separator. The
+# characters are listed, not given as ranges: outside the C locale, bash ranges
+# such as [A-Z] also match letters, digits and symbols beyond U+00FF.
+valid_name() {
+    local chars=abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_
+    [[ $1 == ["$chars"]* && $1 != *[!"$chars"-]* && ${#1} -le 64 && $1 != all ]]
+}
+
+check_new_name() {
+    valid_name "$1" ||
+        usage_error "invalid session name '$1': use letters, digits, '_' and '-' (at most 64 characters, not starting with '-'; 'all' is reserved)."
+}
+
+default_name() {
+    local name=${HOSTNAME%%.*}
+    valid_name "$name" || name=main
+    printf '%s\n' "$name"
+}
+
+# The advice when a new server is still starting after START_TIMEOUT. The time
+# also covers systemd setting up the scope, which is seldom slow, so the config
+# comes first.
+die_starting() {
+    die "$1" \
+        "Most often its config waits on something: look in ~/.tmux.conf, /etc/tmux.conf or, on tmux 3.2 and later, ~/.config/tmux/tmux.conf for a command that waits, such as run-shell, or a plugin manager that downloads." \
+        "Otherwise check: systemctl --user status $SLICE; journalctl --user -n 20" \
+        "Once it has started, run staymux again. If it is stuck, stop it with: staymux -k all"
+}
+
+# Whether process $1, which started at $2 (clock ticks since boot), still runs.
+still_running() { running "$1" && proc_start "$1" && [[ $START_TIME == "$2" ]]; }
+
+# A run that stopped waiting for the server it started leaves that server's
+# first client running, recorded in $STARTING (see start_server). tmux lets
+# later clients in before the config has loaded, and a session created then
+# misses what the config sets later (default-command, say), so wait for that
+# client, as long as start_server does, before opening a session. The caller
+# holds the lock.
+wait_for_start() {
+    local pid start deadline=$((SECONDS + START_TIMEOUT + 1))
+    read -r pid start 2>/dev/null <"$STARTING" || return 0
+    if still_running "$pid" "$start"; then
+        note "waiting up to ${START_TIMEOUT}s for the tmux server that an earlier staymux run started to finish starting."
+        while still_running "$pid" "$start"; do
+            ((SECONDS < deadline)) ||
+                die_starting "the tmux server that an earlier staymux run started is still starting, so staymux did not open a session on it."
+            read -rt 0.2 <> <(:)    # sleep 0.2 s using bash alone
+        done
+    fi
+    rm -f -- "$STARTING"
+}
+
+# Start a tmux server, with $1 as its first session, in a new transient scope
+# in staymux.slice. systemd-run moves itself into the scope and runs the tmux
+# client there; the client forks the server, which inherits the scope and
+# keeps it alive after the client exits. With a systemd-enabled tmux, panes
+# get their own tmux-spawn-*.scope units, placed in the server's slice.
+start_server() {
+    local scope errors client deadline rc=0
+    prepare_systemd
+    report_leftovers
+    # Scope names are unique, so a scope from a crashed server that still holds
+    # stray processes never blocks a start. Failed ones would stay listed in
+    # "failed" state, so clear those.
+    systemctl --user reset-failed 'staymux-*.scope' >/dev/null 2>&1
+    printf -v scope 'staymux-%(%Y%m%d-%H%M%S)T-%d.scope' -1 "$$"
+    # Named like tmx_capture's files, which removes one left by a killed run.
+    errors=$(mktemp "$XDG_RUNTIME_DIR/staymux.$$.XXXXXX") ||
+        die "cannot create a temporary file in $XDG_RUNTIME_DIR (see the error above)." \
+            "Check the free space there: df -h $XDG_RUNTIME_DIR"
+    # SendSIGHUP: interactive shells ignore SIGTERM, so stopping the scope
+    # also sends SIGHUP. No -N here: this is where the server should start,
+    # with the user's own ~/.tmux.conf. tmux keeps this client waiting until
+    # that has loaded, so a run-shell in it that waits (a plugin manager that
+    # clones from the internet, on a host without access) would hold this run,
+    # and the lock, as long. So after START_TIMEOUT this run stops waiting,
+    # and with it lets go of the lock; START_TIMEOUT is below LOCK_TIMEOUT, so
+    # that a run queued behind this one usually gets this run's reason rather
+    # than a lock timeout. Nothing may end the client, though: tmux runs its
+    # new-session only once the config has loaded, and with tmux 3.2 and later
+    # the next client to connect before then would load the config again. So
+    # it runs in the background, in a session of its own (away from this
+    # terminal's hangup and Ctrl-C), and records itself in $STARTING for later
+    # runs to wait for; without that record it doesn't start. Its output goes
+    # to a file that is shown only if it ends in time. ">|" because mktemp has created that file, and a noclobber
+    # inherited through an exported SHELLOPTS would refuse ">".
+    {
+        if ! { proc_start "$BASHPID" && printf '%s %s\n' "$BASHPID" "$START_TIME" >|"$STARTING"; }; then
+            printf 'staymux: cannot record the start of the new tmux server in %s.\n' "$STARTING"
+            exit 1
+        fi
+        exec setsid -w systemd-run --user --scope --quiet --unit="$scope" --slice="$SLICE" \
+            --description="staymux tmux server" --property=SendSIGHUP=yes \
+            tmux -S "$SOCK" new-session -d -s "$1"
+    } 9>&- >|"$errors" 2>&1 &
+    client=$!
+    # kill -0, not running: the client is still execing, and proc_status can
+    # miss a process that execs while it is being read. bash reaps the client
+    # as soon as it exits, so kill -0 then fails.
+    deadline=$((SECONDS + START_TIMEOUT + 1))     # SECONDS counts whole seconds
+    while kill -0 "$client" 2>/dev/null && ((SECONDS < deadline)); do
+        read -rt 0.2 <> <(:)    # sleep 0.2 s using bash alone
+    done
+    if kill -0 "$client" 2>/dev/null; then
+        rm -f -- "$errors"
+        die_starting "the new tmux server did not finish starting within ${START_TIMEOUT}s, so staymux stopped waiting; it goes on starting in the background."
+    fi
+    wait "$client" || rc=$?
+    rm -f -- "$STARTING"
+    cat -- "$errors" >&2
+    rm -f -- "$errors"
+    ((rc == 0)) ||
+        die "could not start the tmux server (see the error above)." \
+            "Check: systemctl --user status $SLICE; journalctl --user -n 20"
+}
+
+# Make sure session $1 exists on a server in staymux.slice, and set SESSION_ID
+# to its id. The caller holds the lock and has run load_sessions.
+ensure_session() {
+    local name=$1 old_pid own_start
+    if ((SERVER_UP)); then
+        [[ -z $SERVER_PID ]] || require_server_in_slice
+        ensure_linger ||
+            warn "lingering is off for $ME, so your sessions will be killed when you log out." \
+                 "Enable it with: loginctl enable-linger $EUID (it may ask for a password, and some sites allow it only from a local login)" \
+                 "Or ask an administrator to run: sudo loginctl enable-linger $EUID"
+        SESSION_ID=$(session_id "$name") && return 0
+        check_new_name "$name"
+        old_pid=$SERVER_PID
+        # The start time of a process forked now, just before new-session.
+        own_start=$(proc_start "$BASHPID" && printf '%s\n' "$START_TIME")
+        tmx new-session -d -s "$name" ||
+            die "could not create session '$name' (see the error above)." "Run staymux again."
+        # A changed server PID means another server answers now. Without -N
+        # (tmux before 3.2) that can be one new-session started in this login
+        # session because the server had just died: not persistent, so it is
+        # removed, by its PID rather than through the socket. It is told apart
+        # from a real server by all of these: it runs outside the slice, holds
+        # nothing but the new session, was not just revived, and started after
+        # new-session was run. A server that took the socket back, revived or by
+        # itself, is older and has sessions of its own, even if only one of the
+        # same name. Any other server is left alone.
+        if ! load_sessions || [[ -n $old_pid && $SERVER_PID != "$old_pid" ]]; then
+            ((SERVER_UP)) ||
+                die "the staymux server stopped while session '$name' was being created." "Run staymux again."
+            if [[ ${NO_START[0]} != -N ]] && ((${#S_ID[@]} == 1 && ${#REVIVE_TRIED[@]} == 0)) &&
+                [[ ${S_NAME[0]} == "$name" ]] && ! server_in_slice &&
+                [[ -n $own_start ]] && proc_start "$SERVER_PID" && ((START_TIME >= own_start)); then
+                kill "$SERVER_PID" 2>/dev/null
+            fi
+            die "another tmux server (PID $SERVER_PID) answered while session '$name' was being created." "Run staymux again."
+        fi
+    else
+        check_new_name "$name"
+        start_server "$name"
+        load_sessions ||
+            die "the tmux server exited right after it started." \
+                "Check ~/.tmux.conf for errors, then run staymux again."
+    fi
+    require_server_in_slice
+    SESSION_ID=$(session_id "$name") ||
+        die "session '$name' ended right after it was created." \
+            "Check your shell and ~/.tmux.conf (default-command), then run staymux again."
+}
+
+# Look for a terminfo entry the way ncurses does. Entries live under their
+# first letter (x/xterm) or, on some builds, its hex code (78/xterm).
+has_terminfo() {
+    local term=$1 dir hex dirs=()
+    [[ -n $term && $term != */* ]] || return 1
+    printf -v hex '%x' "'${term:0:1}"
+    IFS=: read -ra dirs <<<"${TERMINFO:-}:${HOME:-}/.terminfo:${TERMINFO_DIRS:-}:/etc/terminfo:/lib/terminfo:/usr/share/terminfo:/usr/lib/terminfo"
+    for dir in "${dirs[@]}"; do
+        [[ -n $dir && ( -e $dir/${term:0:1}/$term || -e $dir/$hex/$term ) ]] && return 0
+    done
+    return 1
+}
+
+# From a terminal, tmux 3.x refuses every client command, not only attach, if
+# $TERM has no terminfo entry on this host. That is common over SSH from kitty,
+# alacritty or ghostty. Fall back to a common type for our tmux clients; panes
+# are unaffected, they get TERM from tmux's default-terminal option.
+fix_term() {
+    local term
+    TERM_NOTE=
+    if [[ ! -t 0 ]] || has_terminfo "${TERM:-}"; then return 0; fi
+    for term in xterm-256color xterm vt100; do
+        if has_terminfo "$term"; then
+            TERM_NOTE="TERM=${TERM:-(unset)} has no terminfo entry on this host; using TERM=$term for tmux."
+            export TERM=$term
+            return 0
+        fi
+    done
+}
+
+# --- locking -----------------------------------------------------------------
+
+# Serialize staymux runs, so two terminals starting at the same moment cannot
+# start two servers and "-k all" cannot race a start. The lock is fd 9 and is
+# released by unlock or when this process exits; LOCKED says whether we hold it.
+open_lock() {
+    ( umask 077 && : >>"$LOCK" ) 2>/dev/null   # private file; our own umask, which the server inherits, stays as it is
+    exec 9>>"$LOCK"
+}
+lock() {
+    ((!LOCKED)) || return 0
+    open_lock ||
+        die "cannot open the lock file $LOCK." "Check that $XDG_RUNTIME_DIR exists and belongs to you."
+    flock -w "$LOCK_TIMEOUT" 9 ||
+        die "another staymux run has held $LOCK for ${LOCK_TIMEOUT}s." \
+            "See which process holds it with: lslocks" "Let it finish or end it, then run staymux again."
+    LOCKED=1
+}
+# Take the lock only if it is free: -l never waits for another run. Without the
+# lock it only reads, and neither revives a server nor reports leftovers.
+# Returns 1 if another run holds it, and 2 if the lock file cannot be opened.
+try_lock() {
+    ((!LOCKED)) || return 0
+    { open_lock; } 2>/dev/null || return 2
+    if flock -n 9; then
+        LOCKED=1
+        return 0
+    fi
+    exec 9>&-
+    return 1
+}
+unlock() { exec 9>&-; LOCKED=0; }
+
+# --- actions -----------------------------------------------------------------
+
+# Print the loaded sessions as a table. Inside staymux, "*" marks the current
+# one, if this shell's server is the one that answers.
+show_sessions() {
+    local i width=4 current='' mark created target=()
+    if ((INSIDE)) && [[ $SERVER_PID == "$TMUX_PID" ]]; then
+        [[ -z ${TMUX_PANE:-} ]] || target=(-t "$TMUX_PANE")
+        if tmx_capture display-message -p "${target[@]}" '#{session_id}'; then
+            current=$TMX_OUT
+        fi
+    fi
+    for i in "${!S_NAME[@]}"; do
+        ((${#S_NAME[i]} <= width)) || width=${#S_NAME[i]}
+    done
+    printf '  %-*s  %7s  %7s  %s\n' "$width" NAME WINDOWS CLIENTS CREATED
+    for i in "${!S_ID[@]}"; do
+        mark=' '
+        [[ ${S_ID[i]} != "$current" ]] || mark='*'
+        printf -v created '%(%Y-%m-%d %H:%M)T' "${S_CREATED[i]}"
+        printf '%s %-*s  %7s  %7s  %s\n' "$mark" "$width" "${S_NAME[i]}" "${S_WINDOWS[i]}" "${S_CLIENTS[i]}" "$created"
+    done
+}
+
+# In a pane of a server that lost the socket to the one that answers, a
+# session named here would be the other server's: kill-session would kill
+# the wrong one, and switch-client would switch some client of the other
+# server. Refuse.
+require_own_server() {
+    ((INSIDE && SERVER_UP)) || return 0
+    [[ -n $SERVER_PID && $SERVER_PID != "$TMUX_PID" ]] || return 0
+    die "this shell runs in tmux server PID $TMUX_PID, which lost $SOCK to the one that answers (PID $SERVER_PID); staymux would act on that server's sessions, not this shell's." \
+        "To make this shell's server the one that answers instead: kill -USR1 $TMUX_PID; then run staymux again." \
+        "Or detach (prefix key, then d) and run staymux outside tmux to use the sessions of PID $SERVER_PID."
+}
+
+# Return 0 if this process descends from process $1 (by PPid in /proc), 1 if
+# it does not, and 2 if that cannot be told. The walk can stop short: at an
+# ancestor that cannot be read (another user's process, with /proc mounted
+# hidepid), or at the init of a PID namespace (a container, a sandbox) that
+# $1 may be outside of. So reaching init counts only if /proc numbers
+# processes as this one sees them and shows $1 holding our socket: then $1
+# is in the namespace that the walk covered.
+descends_from() {
+    local pid=$$ ppid key value n
+    all_digits "$1" || return 1
+    for ((n = 0; n < 1000; n++)); do
+        [[ $pid != "$1" ]] || return 0
+        ((pid > 1)) || break
+        ppid=''
+        while read -r key value; do
+            if [[ $key == PPid: ]]; then
+                ppid=$value
+                break
+            fi
+        done 2>/dev/null <"/proc/$pid/status"
+        all_digits "$ppid" || return 2
+        pid=$ppid
+    done
+    ((n < 1000)) || return 2
+    [[ /proc/self -ef /proc/$$ ]] || return 2
+    holds_socket "$1" || return 2
+    return 1
+}
+
+# Set Q to session name $1 quoted for the shell, and QQ to it quoted again for
+# the remote shell that ssh hands its command to; a session renamed in tmux
+# can contain anything. Used in the hints of error messages.
+quote_name() {
+    printf -v Q '%q' "$1"
+    printf -v QQ '%q' "$Q"
+    if [[ $1 == -* ]]; then      # not to be read as an option
+        Q="-- $Q" QQ="-- $QQ"
+    fi
+}
+
+# Attaching to session $1 needs a full-screen terminal on standard input.
+require_terminal() {
+    quote_name "$1"
+    [[ -t 0 ]] ||
+        die "cannot attach to '$1': standard input is not a terminal." \
+            "Over SSH, request one: ssh -t $HOSTNAME staymux $QQ"
+    [[ ${TERM:-} != dumb ]] ||
+        die "cannot attach to '$1': TERM=dumb, and tmux needs a full-screen terminal." \
+            "If your terminal can do more, say which type it is, for example: TERM=xterm-256color staymux $Q"
+}
+
+# tmux's screen covers whatever was printed just before it, so after a warning
+# (not a note) give the user a moment to read it: PAUSE_SECONDS, or until Enter.
+pause_after_warnings() {
+    ((WARNED)) && [[ -t 0 && -t 2 ]] || return 0
+    note "continuing in $PAUSE_SECONDS s; press Enter to continue now."
+    read -rt "$PAUSE_SECONDS" _ || :
+}
+
+cmd_open() {
+    local name=$1 have_name=$2
+    [[ -z $OTHER_TMUX ]] ||
+        die "this shell runs inside another tmux server ($OTHER_TMUX); staymux does not nest tmux." \
+            "Detach from it first (prefix key, then d), or use a terminal outside tmux, then run staymux again."
+    # No runtime directory means our user manager is not running (typical
+    # for su or cron without lingering), so no server or session either, and
+    # this run would create one and attach. Check what it can before setting
+    # that up, which can enable lingering.
+    if [[ ! -d $XDG_RUNTIME_DIR ]]; then
+        ((have_name)) || name=$(default_name)
+        check_new_name "$name"
+        require_terminal "$name"
+        prepare_systemd
+    fi
+    # Before the lock too, so that runs started meanwhile each wait for the
+    # stop rather than for the lock.
+    wait_for_slice_stop
+    lock
+    wait_for_slice_stop     # a stop queued since by -k all inside a session
+    wait_for_start
+    load_sessions && report_hidden_servers
+    require_own_server
+
+    if ((!have_name)); then
+        if ((INSIDE)); then
+            show_sessions
+            printf '\nSwitch with: staymux NAME\n'
+            return 0
+        fi
+        if ((${#S_ID[@]} > 1)); then
+            printf 'Several staymux sessions are running:\n\n'
+            show_sessions
+            printf '\nAttach to one with: staymux NAME\n'
+            return 0
+        fi
+        name=${S_NAME[0]:-$(default_name)}
+    fi
+    session_id "$name" >/dev/null || check_new_name "$name"
+
+    if ((INSIDE)); then
+        ensure_session "$name"
+        pause_after_warnings    # holding the lock, so the session can't go meanwhile
+        unlock
+        quote_name "$name"
+        tmx switch-client -t "$SESSION_ID" ||
+            die "could not switch to session '$name' (see the error above)." \
+                "Detach (prefix key, then d) and run: staymux $Q"
+        return 0
+    fi
+
+    require_terminal "$name"
+    [[ -z $TERM_NOTE ]] ||
+        warn "$TERM_NOTE" "To use your terminal's own entry, copy it from your workstation: infocmp -x | ssh $HOSTNAME -- tic -x -"
+    ensure_session "$name"
+    pause_after_warnings    # holding the lock, so the session can't go meanwhile
+    unlock      # the attached client must not keep holding the lock
+    exec tmux -S "$SOCK" "${NO_START[@]}" attach-session -t "$SESSION_ID"
+}
+
+cmd_list() {
+    local lock_rc=0 tries=0
+    [[ ! -d $XDG_RUNTIME_DIR ]] || try_lock || lock_rc=$?
+    while ! load_sessions; do
+        # Without the lock, a server that lost its socket is not revived (see
+        # revive_server), so it would pass for none. A server that another run
+        # is starting or stopping is bound to $SOCK without answering only for
+        # a moment, so ask again for up to a second before saying so. Only a
+        # holder visible here counts (see same_place).
+        if ((lock_rc)); then
+            # The other run may have finished meanwhile.
+            if ((lock_rc == 1)) && try_lock; then
+                lock_rc=0
+                continue
+            fi
+            listening_inodes
+            HOLDERS=()
+            ((${#SOCK_INODES[@]} == 0)) || socket_holders
+            if ((${#HOLDERS[@]} && ++tries <= 10)); then
+                read -rt 0.1 <> <(:)
+                continue
+            fi
+            if ((${#HOLDERS[@]})); then
+                ((lock_rc == 2)) ||
+                    die "no tmux server answers on $SOCK, but one is still bound to it: it lost the socket, or another staymux run is starting or stopping it." \
+                        "That run holds $LOCK, and only a run that holds it can bring back a server that lost its socket." \
+                        "Run staymux -l again once that run has finished."
+                die "no tmux server answers on $SOCK, but one is still bound to it: it lost the socket, or another staymux run is starting or stopping it." \
+                    "This run cannot open $LOCK, and only a run that holds it can bring back a server that lost its socket." \
+                    "Check that $XDG_RUNTIME_DIR belongs to you."
+            fi
+        fi
+        printf 'No staymux sessions are running. Start one with: staymux [NAME]\n'
+        report_leftovers
+        return 0
+    done
+    if [[ -n $SERVER_PID ]] && ! server_in_slice; then
+        if [[ -z $SERVER_CGROUP ]]; then
+            server_gone ||
+                warn "cannot tell which cgroup the server (PID $SERVER_PID) runs in, so cannot check that it runs in $SLICE." \
+                    "If this runs in a container or sandbox, run staymux -l outside it."
+        else
+            warn "the server (PID $SERVER_PID) runs in $SERVER_CGROUP, outside $SLICE, so it may be killed when you log out." \
+                "Save your work, then run: staymux -k all; staymux"
+        fi
+    fi
+    report_hidden_servers
+    if ((${#S_ID[@]} == 0)); then
+        printf 'The staymux server is running but has no sessions. Create one with: staymux [NAME]\n'
+        return 0
+    fi
+    show_sessions
+}
+
+cmd_kill() {
+    local name=$1 id
+    [[ -d $XDG_RUNTIME_DIR ]] ||
+        die "no staymux sessions are running, so there is no session '$name' to kill."
+    lock
+    load_sessions || die "no staymux sessions are running, so there is no session '$name' to kill."
+    report_hidden_servers
+    require_own_server
+    id=$(session_id "$name") ||
+        die "no session named '$name'." "See the running sessions with: staymux -l"
+    tmx kill-session -t "$id" || die "could not kill session '$name' (see the error above)."
+    printf "Killed session '%s'.\n" "$name"
+    # The session is gone either way, so a server that cannot be queried now
+    # (one revived as this one exited, say) is only reported.
+    local status=0
+    load_sessions --soft || status=$?
+    ((status != 1)) || printf 'That was the last session, so the staymux server has exited.\n'
+    ((status != 2)) ||
+        warn "could not query the staymux server afterwards: $LOAD_ERROR" "See what to do with: staymux -l"
+}
+
+# Stop the server, every pane and any stray process left in staymux.slice by
+# an earlier crash. A systemd-enabled tmux moves each pane into its own
+# tmux-spawn-*.scope, but those land in the server's slice, and stopping a
+# slice stops every unit in it.
+kill_all() {
+    local count=0 before=0 after=0 before_rc=0 pid servers them its holds strays=() hints=()
+    if [[ ! -d $XDG_RUNTIME_DIR ]]; then
+        printf 'No staymux sessions are running.\n'
+        return 0
+    fi
+    lock
+    if ((INSIDE)); then
+        # This shell is one of the processes being stopped, so nothing can be
+        # reported once the stop has begun. Stopping the slice would leave a
+        # server outside it running if it holds the socket and is not the one
+        # that answers (kill-server below ends that one), so refuse first.
+        listening_inodes
+        socket_holders
+        for pid in "${HOLDERS[@]}"; do
+            [[ $pid != "$SERVER_PID" ]] || continue
+            running "$pid" || continue
+            if ! pid_cgroup "$pid" || [[ $PID_CGROUP != */user@"$EUID".service/"$SLICE"/* ]]; then
+                strays+=("$pid")
+            fi
+        done
+        if ((${#strays[@]})); then
+            if ((${#strays[@]} == 1)); then
+                servers="a tmux server outside $SLICE (PID ${strays[0]})" them=it its=its holds=holds
+            else
+                servers="tmux servers outside $SLICE (PID ${strays[*]})" them=them its=their holds=hold
+            fi
+            hints=("Stop $them and $its sessions with: kill -KILL ${strays[*]}")
+            if [[ " ${strays[*]} " == *" $TMUX_PID "* ]]; then
+                hints+=("This shell runs in PID $TMUX_PID, so run staymux -k all again from another terminal.")
+            else
+                hints+=("Then run staymux -k all again.")
+            fi
+            # Without an answer, the server that kill-server below would end
+            # cannot be told apart from the others.
+            [[ -z $LOAD_ERROR ]] ||
+                die "could not query the tmux server ($LOAD_ERROR), so stopping $SLICE may leave running $servers, which $holds $SOCK." \
+                    "${hints[@]}"
+            die "$servers also $holds $SOCK, and stopping $SLICE would leave $them running." \
+                "See $them with: staymux -l" "${hints[@]}"
+        fi
+        [[ -z $LOAD_ERROR ]] ||
+            warn "could not query the staymux server ($LOAD_ERROR); stopping $SLICE anyway."
+        printf 'Stopping all staymux sessions, including this one.\n'
+        # A hangup from a pane that kill-server closes (this shell's own
+        # server may have taken the socket back meanwhile) must not end the
+        # run before the stop is queued.
+        trap '' HUP
+        # kill-server ends the answering server even outside the slice. If
+        # that is not this shell's server, ending it cannot end this shell, so
+        # do it first: the stop queued below may end this shell before it
+        # gets there.
+        [[ -z $SERVER_PID || $SERVER_PID == "$TMUX_PID" ]] || tmx kill-server 2>/dev/null
+        # Queue the stop job with systemd, which finishes it after this process
+        # is gone; a run that starts or attaches meanwhile waits for it
+        # (wait_for_slice_stop).
+        systemctl --user stop --no-block "$SLICE" ||
+            die "could not stop $SLICE (see the error above)." \
+                "From a shell outside staymux, run: systemctl --user stop $SLICE"
+        tmx kill-server 2>/dev/null     # this shell's server, if it runs outside the slice
+        exit 0
+    fi
+    # kill-server hangs up every pane. If this run's terminal still depends on
+    # one without $TMUX saying so (sudo drops it; ssh from a pane back to this
+    # host), the hangup must not end the run before the slice is swept.
+    trap '' HUP
+    # A failed query must not stop the cleanup: stopping the slice needs no tmux.
+    load_sessions --soft || before=$?
+    case $before in
+        0)  count=${#S_ID[@]}
+            tmx kill-server 2>/dev/null ;;  # first, so that tmux hangs up every pane cleanly
+        2)  before_rc=$LOAD_RC      # the second query below overwrites LOAD_RC
+            warn "could not query the staymux server ($LOAD_ERROR); stopping $SLICE anyway." ;;
+    esac
+    # Sweep up what is left: panes that ignored the hangup, processes from an
+    # earlier crash, and the server itself if kill-server failed. systemd sends
+    # SIGTERM and SIGHUP, then SIGKILL after the unit's stop timeout.
+    systemctl --user stop "$SLICE" ||
+        die "could not stop $SLICE (see the error above)." "Check: systemctl --user status $SLICE"
+    systemctl --user reset-failed 'staymux-*.scope' >/dev/null 2>&1
+    load_sessions --soft || after=$?
+    case $after in
+        0)  die "a tmux server still answers on $SOCK (PID ${SERVER_PID:-unknown})." \
+                "Stop it with: tmux -S $SOCK kill-server" ;;
+        2)  if ((LOAD_RC == 124)); then
+                listening_inodes
+                socket_holders
+                ((${#HOLDERS[@]} == 0)) ||
+                    die "a tmux server outside $SLICE (PID ${HOLDERS[*]}) still holds $SOCK and does not answer." \
+                        "Stop it with: kill -KILL ${HOLDERS[*]}"
+                die "a process outside $SLICE still holds $SOCK and does not answer." \
+                    "Find it with: ss -xlp src $SOCK; then stop it with: kill -KILL PID"
+            fi
+            ((!LOAD_LOCAL)) ||
+                die "$SLICE is stopped, but staymux cannot check that no tmux server is left: $LOAD_ERROR." \
+                    "Check the free space in $XDG_RUNTIME_DIR: df -h $XDG_RUNTIME_DIR"
+            die "$SLICE is stopped, but tmux still cannot use $SOCK: $LOAD_ERROR" \
+                "If no tmux server of yours is left (check: pgrep -u $EUID -a tmux), remove the socket: rm -f -- $SOCK" ;;
+    esac
+    case $before in
+        0) printf 'Killed %d staymux session(s) and the server.\n' "$count" ;;
+        1) printf 'No staymux server was running; cleaned up %s.\n' "$SLICE" ;;
+        2) if ((before_rc == 124)); then
+               printf 'Stopped %s, including the unresponsive tmux server.\n' "$SLICE"
+           else
+               printf 'Stopped %s; no staymux server is left.\n' "$SLICE"
+           fi ;;
+    esac
+}
+
+main() {
+    local action=open name='' actions=0 args=()
+    while (($#)); do
+        case $1 in
+            -h | --help) action=help ;;
+            -V | --version) action=version ;;
+            -l) action=list ;;
+            -k) (($# >= 2)) || usage_error '-k needs a session name or "all".'
+                action=kill name=$2
+                shift ;;
+            --) shift; args+=("$@"); break ;;
+            -?*) usage_error "unknown option: $1" ;;
+            *) args+=("$1"); shift; continue ;;
+        esac
+        ((++actions))
+        shift
+    done
+    ((actions <= 1)) || usage_error "use only one of -l, -k, -h and -V."
+    if [[ $action == open ]]; then
+        ((${#args[@]} <= 1)) || usage_error "give at most one session name, not ${#args[@]}: ${args[*]}"
+        if ((${#args[@]} == 1)); then
+            name=${args[0]}
+            [[ -n $name ]] || usage_error "the session name is empty."
+        fi
+    else
+        ((${#args[@]} == 0)) || usage_error "unexpected argument: ${args[0]}"
+        [[ $action != kill || -n $name ]] || usage_error "the session name is empty."
+    fi
+
+    if [[ $action == help ]]; then
+        usage
+        exit 0
+    fi
+    # Before the root check, so an administrator can audit an install.
+    if [[ $action == version ]]; then
+        printf 'staymux %s\n' "$VERSION"
+        exit 0
+    fi
+    ((EUID != 0)) ||
+        die "refusing to run as root: the server and its sessions would belong to root." \
+            "Run staymux as your own user (leave the root shell or drop sudo)."
+    check_requirements
+    setup_environment
+    # $TMUX naming our socket counts only for a process that descends from its
+    # server: one started from a pane and since moved away (an editor's
+    # terminal, say) only inherited it, and switch-client would act on the
+    # pane's client instead. Where descent cannot be told, $TMUX is trusted.
+    # It is also left over from a crash if its server neither answers nor
+    # still holds the socket. In both cases behave as outside tmux. (Without
+    # the lock, -l revives no server, so this shell's may hold the socket
+    # without answering.) A query error ends the run here, except for -k all,
+    # which can still stop the slice.
+    local status=0 descent=0 held=0
+    if ((INSIDE)); then
+        # Locked first, so that a server this check revives cannot be one
+        # that another run is starting; -l only takes the lock if it is free.
+        if [[ -d $XDG_RUNTIME_DIR ]]; then
+            if [[ $action == list ]]; then try_lock; else lock; fi
+        fi
+        load_sessions --soft || status=$?
+        descends_from "$TMUX_PID" || descent=$?
+        [[ $TMUX_PID == "$SERVER_PID" ]] || holds_socket "$TMUX_PID" || held=$?
+        if ((descent == 1 || held == 1)); then
+            unset TMUX TMUX_PANE
+            INSIDE=0
+        fi
+        # The action would only find the same error, after waiting again;
+        # -k all inside staymux needs no query.
+        ((status != 2)) || [[ $action == kill && $name == all ]] || die_load_error
+    fi
+
+    case $action in
+        open) cmd_open "$name" "${#args[@]}" ;;
+        list) cmd_list ;;
+        kill) if [[ $name == all ]]; then kill_all; else cmd_kill "$name"; fi ;;
+    esac
+}
+
+# Run unless sourced, as the tests do: only a sourced file can return here.
+(return 0 2>/dev/null) || main "$@"

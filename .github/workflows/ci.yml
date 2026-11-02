@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install tmux, bubblewrap, pytest and shellcheck
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends tmux bubblewrap python3-pytest shellcheck
+      # Ubuntu 24.04 stops unprivileged programs such as bubblewrap from creating user namespaces.
+      - name: Let bubblewrap create user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: shellcheck
+        run: shellcheck staymux
+      # STAYMUX_NO_SKIPS fails the run on a skipped test, such as a namespace test the runner no longer allows.
+      - name: Tests, none skipped
+        run: STAYMUX_NO_SKIPS=1 /usr/bin/python3 run-tests -rs

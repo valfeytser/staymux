@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+"""Run staymux's tests in a bubblewrap sandbox.
+
+    ./run-tests [PYTEST-ARG...]      every test, or those the arguments select: ./run-tests tests/test_start.py -k slice
+    ./run-tests -- COMMAND [ARG...]  any other command, such as a probe of a new fixture, in the same sandbox
+
+The command runs from the checkout, so give paths relative to it. It sees every file read-only, gets an empty
+private scratch folder as its HOME and TMPDIR, private /tmp, /run and /dev, no network, its own process namespace and
+no input, and none of the variables that lead to your session's services. So a test that forgets to stub a command
+can't change your files, and doesn't find your tmux servers, D-Bus or systemd user manager where it would look. Its
+output comes back through pipes rather than your own descriptors, which it could otherwise reopen through /proc for
+writing. Before anything runs, a probe checks that the sandbox holds; when bubblewrap is missing or the probe fails,
+nothing runs. conftest.py makes pytest refuse to run without it.
+
+This guards against accidents, not hostile code: a test can still read your files, and a Unix socket it can
+see outside the hidden folders still connects.
+"""
+
+import os
+import site
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+PYTEST = [sys.executable, "-m", "pytest"]  # pytest.ini holds its options
+# Locations of your caches and configuration outside the scratch folder, and of your session's services.
+UNSET = [
+    "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR",
+    "SSH_AUTH_SOCK", "DBUS_SESSION_BUS_ADDRESS", "DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "GPG_AGENT_INFO",
+    "TMUX", "TMUX_PANE", "TMUX_TMPDIR",
+]
+MARKER = "STAYMUX_TEST_SANDBOX"  # set inside the sandbox; conftest.py refuses to run without it
+TMP = Path("/tmp")  # the sandbox mounts a private tmpfs over it; nothing is written to the real one
+
+
+def inside_tmp(path):
+    return TMP in Path(path).parents
+
+
+def sandboxed(command, scratch):
+    """Wrap command so it sees every file read-only, except its empty, private scratch folder and /tmp."""
+    home = f"{scratch}/home"
+    unset = [arg for name in UNSET for arg in ("--unsetenv", name)]
+    # The private /tmp hides the real one. Show what the command must reach there again, read-only: the checkout,
+    # the caller's temp folder, and the Python that runs pytest with everything it imports from. A path that doesn't
+    # exist, such as a user base nobody has made, is left out.
+    python = [sys.prefix, sys.base_prefix, site.getuserbase(), *filter(None, sys.path)]
+    needed = [ROOT, Path(scratch).parent, *map(Path, python)]
+    shown = sorted({str(path) for path in needed if inside_tmp(path)})
+    keep = [arg for path in shown for arg in ("--ro-bind-try", path, path)]
+    return [
+        "bwrap",
+        "--die-with-parent",
+        "--new-session",
+        "--unshare-all",
+        "--ro-bind", "/", "/",
+        "--dev", "/dev",
+        "--proc", "/proc",
+        "--tmpfs", "/run",
+        "--tmpfs", "/tmp",
+        *keep,
+        "--tmpfs", str(scratch),
+        "--dir", home,
+        "--setenv", "HOME", home,
+        "--setenv", "TMPDIR", str(scratch),
+        "--setenv", MARKER, "1",
+        "--setenv", "PYTHONDONTWRITEBYTECODE", "1",
+        # HOME moves into the scratch folder; keep pytest visible when pip installed it with --user.
+        "--setenv", "PYTHONUSERBASE", site.getuserbase(),
+        *unset,
+        "--chdir", str(ROOT),
+        "--",
+        *command,
+    ]
+
+
+def run_sandboxed(command, relay=True):
+    """Run command in a fresh sandbox and return its exit status and, unless relayed, its output."""
+    # The scratch folder is only a mount point for the sandbox's own tmpfs, so it stays empty out here.
+    scratch = tempfile.mkdtemp(prefix="staymux-tests-")
+    try:
+        process = subprocess.Popen(
+            sandboxed(command, scratch), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+        )
+        kept, lost = [], False
+        for chunk in iter(lambda: process.stdout.read1(65536), b""):
+            if not relay:
+                kept.append(chunk)
+            elif not lost:
+                try:
+                    sys.stdout.buffer.write(chunk)
+                    sys.stdout.buffer.flush()
+                except (OSError, ValueError):
+                    lost = True  # read on, so the tests never block on a full pipe
+        status = process.wait()
+    finally:
+        os.rmdir(scratch)
+    if lost and status == 0:
+        status = 1  # the output was lost, so the run can't count as a pass
+    return status, b"".join(kept).decode(errors="replace")
+
+
+def sandbox_problem():
+    """Say why the tests can't be sandboxed here, or None when the sandbox holds."""
+    # Folders you can write; none may be writable inside. A temp folder that is /tmp itself is replaced.
+    temp = Path(tempfile.gettempdir())
+    guarded = [ROOT, Path.home(), *([temp] if temp != TMP else [])]
+    probe = ["sh", "-c", 'for path; do if test -w "$path"; then echo "$path"; fi; done', "sh", *map(str, guarded)]
+    try:
+        status, output = run_sandboxed(probe, relay=False)
+    except FileNotFoundError:
+        return "bubblewrap (bwrap) is not installed; install the bubblewrap package"
+    except OSError as error:
+        return f"bwrap could not start: {error}"
+    if status:
+        return f"bwrap could not build the sandbox: {output.strip()}"
+    if output.strip():
+        return "the sandbox leaves writable: " + ", ".join(output.split())
+    return None
+
+
+def main(arguments):
+    command = arguments[1:] if arguments[:1] == ["--"] else PYTEST + arguments
+    if not command:
+        print("run-tests: give a command after --.", file=sys.stderr)
+        return 2
+    problem = sandbox_problem()
+    if problem:
+        print(f"run-tests: not running the tests: {problem}.", file=sys.stderr)
+        return 2
+    return run_sandboxed(command)[0]
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

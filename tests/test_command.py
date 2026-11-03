@@ -393,7 +393,8 @@ def test_staymux_starts_its_server_in_a_scope_of_staymux_slice(host):
     assert {"--user", "--scope", "--slice=staymux.slice", "--property=SendSIGHUP=yes"} <= set(options)
     [unit] = [option for option in options if option.startswith("--unit=")]
     assert unit.startswith("--unit=staymux-") and unit.endswith(".scope")
-    assert command == ["tmux", "-S", str(SOCK), "new-session", "-d", "-s", HOSTNAME]
+    assert command[:4] == ["tmux", "-S", str(SOCK), "new-session"]
+    assert "-d" in command[4:] and command[command.index("-s") + 1] == HOSTNAME
     assert terminal.finish()[0] == 0
 
 

@@ -21,10 +21,12 @@ CI instead lifts the restriction for every program until the next boot (`sysctl 
 ./run-tests                                 # every test
 ./run-tests tests/test_start.py -k slice    # arguments go to pytest; paths are relative to the checkout
 ./run-tests -- bash -c '...'                # any other command, such as a probe, in the same sandbox
-shellcheck staymux
+shellcheck -x staymux tests/host/*
 ```
 
 `run-tests` sandboxes the tests with bubblewrap, and pytest refuses to run without it. Run a new fixture's first try, or any experiment with one, through it too. Set `STAYMUX_NO_SKIPS=1` to fail on any skipped test, as CI does.
+
+`tests/test_command.py` runs staymux as a command, on a terminal of its own or from a pane, and checks what its user sees. Its stubs in `tests/host` stand in for systemd, logind and the PID namespace, and `tests/host/staymux` stands in for the kernel's view of cgroups, which the sandbox hides. Test there what a user can see; test a single function only for what the command can't reach, such as a race or a forged socket listing.
 
 The tests stub systemd. A change to how staymux works with logind, lingering or scopes needs a try on a disposable VM too; say in the pull request what you ran there and what you saw.
 

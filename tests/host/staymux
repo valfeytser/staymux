@@ -13,7 +13,7 @@
 
 [[ -d ${STAYMUX_TEST_HOST:-} ]] || { echo 'tests/host/staymux: STAYMUX_TEST_HOST names no folder' >&2; exit 125; }
 
-# shellcheck source=../../staymux
+# shellcheck source=SCRIPTDIR/../../staymux
 source "${BASH_SOURCE[0]%/*}/../../staymux" || exit 125
 
 # What follows replaces parts of staymux by name, so a rename there must fail here, not pass by testing less.

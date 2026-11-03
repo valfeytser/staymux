@@ -5,7 +5,11 @@
 # agent would, and any other fails at once. Without one, it sets or clears lingering for that UID.
 host=${STAYMUX_TEST_HOST:?}
 { printf busctl; printf ' %q' "$@"; echo; } >>"$host/calls"
-if [[ " $* " != *' org.freedesktop.login1.Manager SetUserLinger ubb '* ]]; then
+# busctl's own options, then the call: logind's SetUserLinger on the system bus, with a UID and two booleans.
+args=("$@")
+while [[ ${args[0]:-} == --* ]]; do args=("${args[@]:1}"); done
+call='call org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager SetUserLinger ubb'
+if [[ ${#args[@]} != 9 || ${args[*]:0:6} != "$call" || " $* " == *' --user '* ]]; then
     printf 'busctl %s\n' "$*" >>"$host/unexpected"
     echo "busctl stub: unexpected call: $*" >&2
     exit 1

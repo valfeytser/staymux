@@ -35,7 +35,7 @@ TMUX_CONF = "set -g default-shell /bin/sh\nset -g default-command 'exec sleep 36
 
 
 def wait_until(condition, timeout, step=0.02):
-    """Call condition until it returns something true, and return that, or None after timeout seconds."""
+    """Call condition until it returns something true and return that, or its last answer after timeout seconds."""
     deadline = time.monotonic() + timeout
     while True:
         found = condition()

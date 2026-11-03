@@ -26,7 +26,10 @@ pytestmark = pytest.mark.skipif(not shutil.which("tmux"), reason="native tmux re
 
 HOST = Path(__file__).resolve().parent / "host"
 STAYMUX = HOST / "staymux"
+SCRIPT = HOST.parent.parent / "staymux"
+BASH = shutil.which("bash") or "/bin/bash"
 UID = os.getuid()
+ME = subprocess.run(["id", "-un"], capture_output=True, text=True, check=True).stdout.strip()
 RUN = Path(f"/run/user/{UID}")  # where staymux always looks; the sandbox's /run is its own
 SOCK = RUN / "staymux.sock"
 HOSTNAME = "testhost"  # bash keeps the one it is given, so no message names the machine running the tests
@@ -65,24 +68,18 @@ def started_by(state):
 
 
 def sweep(state):
-    """End the processes one test started and wait until they have gone."""
-    pids = started_by(state)
-    for pid in pids:
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-
-    def gone():
+    """End the processes one test started, and any they start meanwhile, and wait until they have gone."""
+    for _ in range(50):
+        pids = started_by(state)
+        if not pids:
+            return
         for pid in pids:
             try:
-                if Path(f"/proc/{pid}/stat").read_text().rpartition(")")[2].split()[0] != "Z":
-                    return False
-            except OSError:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
                 pass
-        return True
-
-    wait_until(gone, 5)
+        wait_until(lambda pids=pids: not set(pids) & set(started_by(state)), 1)
+    pytest.fail(f"processes of {state} kept starting: {started_by(state)}")
 
 
 def gone_pid():
@@ -123,7 +120,7 @@ class Terminal:
         if self.status is None:
             pid, status = os.waitpid(self.pid, os.WNOHANG)
             if pid:
-                self.status = os.waitstatus_to_exitcode(status)
+                self.status = os.WEXITSTATUS(status) if os.WIFEXITED(status) else -os.WTERMSIG(status)
         return self.status is not None
 
     def client(self):
@@ -162,6 +159,7 @@ class Terminal:
         if not self._ended():
             os.kill(self.pid, signal.SIGKILL)
             wait_until(self._ended, 5)
+        self.reader.join(5)  # it ends once the terminal hangs up; its fd must not be reused under it
         os.close(self.fd)
 
 
@@ -245,7 +243,7 @@ class Host:
         """
         self.panes += 1
         out, err, status = (self.state / f"pane{self.panes}.{part}" for part in ("out", "err", "status"))
-        command = f"{shlex.join([str(STAYMUX), *args])} >{shlex.quote(str(out))} 2>{shlex.quote(str(err))}"
+        command = f"{' '.join(shlex.quote(word) for word in [str(STAYMUX), *args])} >{shlex.quote(str(out))} 2>{shlex.quote(str(err))}"
         command += f"; echo $? >{shlex.quote(str(status))}"
         created = self.tmux("new-window", "-t", f"={session}:", command)
         assert created.returncode == 0, created.stderr
@@ -255,7 +253,9 @@ class Host:
                 return True
             return ends_server and self.tmux("has-session").returncode != 0
 
-        assert wait_until(ended, 20), f"staymux did not end in the pane within 20s:\n{out.read_text()}{err.read_text()}"
+        if not wait_until(ended, 20):
+            said = "".join(path.read_text() for path in (out, err) if path.exists())
+            pytest.fail(f"staymux did not end in the pane within 20s:\n{said}")
         code = status.read_text() if status.exists() else ""
         return int(code) if code.endswith("\n") else None, out.read_text(), err.read_text()
 
@@ -268,8 +268,10 @@ class Host:
     def close(self):
         for terminal in self.terminals:
             terminal.close()
+        self.tmux("kill-server")  # even one whose environment no longer names this test (see started_by)
         sweep(self.state)
-        shutil.rmtree(RUN, ignore_errors=True)
+        for made in ("/run/user", "/run/systemd"):  # the fixture made both; see host()
+            shutil.rmtree(made, ignore_errors=True)
         unexpected = self.state / "unexpected"
         assert not unexpected.exists(), "staymux made calls no stub expects:\n" + unexpected.read_text()
 
@@ -430,9 +432,8 @@ def test_the_sessions_get_a_login_s_own_environment_whatever_staymux_inherited(h
     assert terminal.attached() == "alpha", terminal.text()
     pane = host.tmux("display-message", "-p", "-t", "=alpha:", "#{pane_pid}").stdout.strip()
     env = dict(entry.split("=", 1) for entry in Path(f"/proc/{pane}/environ").read_text().split("\0") if entry)
-    me = subprocess.run(["id", "-un"], capture_output=True, text=True, check=True).stdout.strip()
     assert env.get(variable) == (folder if kept else None)
-    assert (env["USER"], env["LOGNAME"], env["HOME"]) == (me, me, str(host.home))
+    assert (env["USER"], env["LOGNAME"], env["HOME"]) == (ME, ME, str(host.home))
     assert env["XDG_RUNTIME_DIR"] == str(RUN)
     assert env["DBUS_SESSION_BUS_ADDRESS"] == f"unix:path={RUN}/bus"
     assert terminal.finish()[0] == 0
@@ -463,11 +464,10 @@ def test_staymux_turns_lingering_on_before_it_starts_a_server(host):
     (host.state / "linger").unlink()
     terminal = host.terminal("alpha")
     assert terminal.attached() == "alpha", terminal.text()
-    me = subprocess.run(["id", "-un"], capture_output=True, text=True, check=True).stdout.strip()
     status, shown = terminal.finish()
     assert status == 0, shown
     assert (
-        f"staymux: enabling lingering for {me} so that sessions survive logout (loginctl enable-linger {UID}).\n"
+        f"staymux: enabling lingering for {ME} so that sessions survive logout (loginctl enable-linger {UID}).\n"
         in shown
     )
     assert (host.state / "linger").read_text().strip() == str(UID)
@@ -488,10 +488,16 @@ def test_staymux_does_not_wait_for_a_password_nobody_can_give_for_lingering(host
     assert host.sessions() == []
 
 
+def in_a_cgroup_namespace():
+    """True if this process sees itself at the root of every cgroup tree, as in a cgroup namespace of its own."""
+    return all(line.split(":", 2)[2] == "/" for line in Path("/proc/self/cgroup").read_text().splitlines())
+
+
+@pytest.mark.skipif(not in_a_cgroup_namespace(), reason="needs the cgroup namespace the sandbox makes where it can")
 def test_staymux_as_it_is_refuses_a_server_whose_cgroup_it_cannot_see(host):
     # The plain file, without tests/host/staymux standing in for the kernel: in a cgroup namespace such as this
     # sandbox's, no process shows which unit it runs in, so staymux cannot check that its server outlives logout.
-    terminal = host.terminal("alpha", command=(shutil.which("bash"), str(HOST.parent.parent / "staymux")))
+    terminal = host.terminal("alpha", command=(BASH, str(SCRIPT)))
     assert terminal.attached() is None
     status, shown = terminal.finish()
     assert status == 1

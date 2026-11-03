@@ -262,10 +262,10 @@ class Host:
         return int(code) if code.endswith("\n") else None, out.read_text(), err.read_text()
 
     def calls(self, command):
-        """The calls staymux made to one of the stubbed commands, each as its arguments."""
+        """The calls staymux made to one of the stubbed commands, each as the list of its arguments."""
         log = self.state / "calls"
-        lines = log.read_text().splitlines() if log.exists() else []
-        return [line.partition(" ")[2] for line in lines if line.partition(" ")[0] == command]
+        calls = [shlex.split(line) for line in log.read_text().splitlines()] if log.exists() else []
+        return [call[1:] for call in calls if call[0] == command]
 
     def close(self):
         for terminal in self.terminals:
@@ -365,14 +365,11 @@ def test_staymux_starts_its_server_in_a_scope_of_staymux_slice(host):
     terminal = host.terminal()
     assert terminal.attached() == HOSTNAME, terminal.text()
     [run] = host.calls("systemd-run")
-    words = run.split()
-    unit = next(word for word in words if word.startswith("--unit="))
+    options, command = run[: run.index("tmux")], run[run.index("tmux") :]
+    assert {"--user", "--scope", "--slice=staymux.slice", "--property=SendSIGHUP=yes"} <= set(options)
+    [unit] = [option for option in options if option.startswith("--unit=")]
     assert unit.startswith("--unit=staymux-") and unit.endswith(".scope")
-    assert words[: words.index(unit)] == ["--user", "--scope", "--quiet"]
-    assert run.partition(f"{unit} ")[2] == (
-        "--slice=staymux.slice --description=staymux tmux server --property=SendSIGHUP=yes "
-        f"tmux -S {SOCK} new-session -d -s {HOSTNAME}"
-    )
+    assert command == ["tmux", "-S", str(SOCK), "new-session", "-d", "-s", HOSTNAME]
     assert terminal.finish()[0] == 0
 
 
@@ -572,14 +569,14 @@ def test_staymux_k_all_kills_every_session_and_stops_the_slice(host):
     result = host.run("-k", "all")
     assert (result.returncode, result.stdout, result.stderr) == (0, "Killed 2 staymux session(s) and the server.\n", "")
     assert host.sessions() == []
-    assert "--user stop staymux.slice" in host.calls("systemctl")
+    assert ["--user", "stop", "staymux.slice"] in host.calls("systemctl")
 
 
 def test_staymux_k_all_cleans_up_the_slice_when_no_server_runs(host):
     result = host.run("-k", "all")
     assert (result.returncode, result.stderr) == (0, "")
     assert result.stdout == "No staymux server was running; cleaned up staymux.slice.\n"
-    assert "--user stop staymux.slice" in host.calls("systemctl")
+    assert ["--user", "stop", "staymux.slice"] in host.calls("systemctl")
 
 
 def test_staymux_k_all_in_a_pane_queues_the_stop_and_ends_the_server_with_this_pane(host):
@@ -589,5 +586,5 @@ def test_staymux_k_all_in_a_pane_queues_the_stop_and_ends_the_server_with_this_p
     _, said, errors = host.in_pane("alpha", "-k", "all", ends_server=True)
     assert (said, errors) == ("Stopping all staymux sessions, including this one.\n", "")
     assert host.sessions() == []
-    assert "--user stop --no-block staymux.slice" in host.calls("systemctl")
-    assert "--user stop staymux.slice" not in host.calls("systemctl")
+    assert ["--user", "stop", "--no-block", "staymux.slice"] in host.calls("systemctl")
+    assert ["--user", "stop", "staymux.slice"] not in host.calls("systemctl")

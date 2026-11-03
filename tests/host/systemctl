@@ -3,7 +3,7 @@
 # "ID UNIT TYPE STATE" line each; none without the file), and accepts the resets and stops staymux asks for, without doing them. Every
 # call is logged in calls; one staymux has no business making goes to unexpected as well, and fails.
 host=${STAYMUX_TEST_HOST:?}
-printf 'systemctl %s\n' "$*" >>"$host/calls"
+{ printf systemctl; printf ' %q' "$@"; echo; } >>"$host/calls"
 case $* in
     '--user show --property=Version') echo 'Version=999' ;;
     '--user list-jobs --no-legend --full'*)

@@ -3,7 +3,7 @@
 # in STAYMUX_TEST_CGROUP for tests/host/staymux to read, or fails as systemd would refuse it if
 # $STAYMUX_TEST_HOST/run-fails exists. Every call is logged in calls.
 host=${STAYMUX_TEST_HOST:?}
-printf 'systemd-run %s\n' "$*" >>"$host/calls"
+{ printf systemd-run; printf ' %q' "$@"; echo; } >>"$host/calls"
 unit='' slice='' user=0 scope=0
 while [[ $1 == -* ]]; do
     case $1 in

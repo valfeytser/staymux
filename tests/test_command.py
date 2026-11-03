@@ -4,7 +4,7 @@ Each test gets a host of its own: a private /run/user/$UID, a home with a tmux.c
 tests/host first on PATH, where stubs stand in for systemd, logind and the PID namespace, and tests/host/staymux runs
 staymux itself (it says why it stands in for the kernel's cgroups too). tmux is real. The stubs keep their state in
 the test's host folder: calls (every call), unexpected (calls staymux has no business making, which fail the test),
-linger, policy, run-fails and pid-ns, each described in the stub that reads it.
+linger, policy, run-fails, pid-ns and cgroups, each described in the stub that reads it.
 """
 
 import contextlib
@@ -194,6 +194,10 @@ class Host:
     def pid_namespace(self, which):
         """Say which PID namespace staymux runs in: initial, child or unknown (see tests/host/readlink)."""
         (self.state / "pid-ns").write_text(f"{which}\n")
+
+    def cgroups(self, layout):
+        """Say how /proc/PID/cgroup reads, "{cgroup}" standing for the process's cgroup (see tests/host/staymux)."""
+        (self.state / "cgroups").write_text(layout)
 
     def env(self, **changes):
         """The environment of a login on this host, with the given changes; a change to None unsets a variable."""
@@ -571,6 +575,69 @@ def test_staymux_as_installed_hands_its_arguments_on(host, args, said):
     result = host.run(*args, command=(str(SCRIPT),))
     assert result.returncode == 0, result.stderr
     assert result.stdout.startswith(said), result.stdout
+
+
+# --- which cgroup the server runs in ---------------------------------------------------------------------------------
+
+# How /proc/PID/cgroup reads for a process in {cgroup} on each kind of host, as RHEL 8.10 and Ubuntu 24.04 show it.
+# cgroup v2 has one line. RHEL 8 keeps cgroup v1, where systemd tracks processes in its name=systemd hierarchy;
+# a scope of the user's own manager moves a process in that one alone, so the controllers' lines still name the login
+# it came from. Once anything has mounted cgroup2 there, every process also shows at the unified hierarchy's root.
+# systemd's hybrid mode tracks processes in both.
+LOGIN = f"/user.slice/user-{UID}.slice/session-1.scope"
+CGROUP_V1 = (
+    f"12:pids:{LOGIN}\n11:net_cls,net_prio:/\n10:blkio:/system.slice/sshd.service\n"
+    f"9:devices:/system.slice/sshd.service\n8:cpuset:/\n7:rdma:/\n6:freezer:/\n5:memory:{LOGIN}\n4:hugetlb:/\n"
+    "3:perf_event:/\n2:cpu,cpuacct:/\n1:name=systemd:{cgroup}\n"
+)
+HOSTS = {
+    "v2": "0::{cgroup}\n",
+    "v1": CGROUP_V1,
+    "v1-with-cgroup2-mounted": CGROUP_V1 + "0::/\n",
+    "hybrid": CGROUP_V1 + "0::{cgroup}\n",
+}
+
+
+@pytest.mark.parametrize("cgroups", HOSTS.values(), ids=HOSTS.keys())
+def test_staymux_finds_its_server_in_staymux_slice_on_each_kind_of_host(host, cgroups):
+    # staymux refuses to attach to a new server it cannot find in the slice, and staymux -l warns of one.
+    host.cgroups(cgroups)
+    host.started("alpha")
+    result = host.run("-l")
+    assert (result.returncode, result.stderr) == (0, ""), result.stderr
+    assert result.stdout.startswith("  NAME "), result.stdout
+
+
+@pytest.mark.parametrize("cgroups", HOSTS.values(), ids=HOSTS.keys())
+def test_staymux_l_warns_of_a_server_outside_staymux_slice_on_each_kind_of_host(host, cgroups):
+    # One started from the login with plain tmux on staymux's socket, so it runs in the login's scope.
+    host.cgroups(cgroups)
+    started = host.tmux("new-session", "-d", "-s", "alpha")
+    assert started.returncode == 0, started.stderr
+    result = host.run("-l")
+    assert result.returncode == 0
+    assert result.stderr == (
+        f"staymux: the server (PID {host.server_pid()}) runs in {LOGIN}, outside staymux.slice, so it may be killed"
+        " when you log out.\n  Save your work, then run: staymux -k all; staymux\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "cgroups",
+    ["0::/\n", "0::/..\n", "0::/../..{cgroup}\n", "1:name=systemd:/../..{cgroup}\n"],
+    ids=["at-its-root", "above-its-root", "elsewhere", "elsewhere-on-cgroup-v1"],
+)
+def test_staymux_l_cannot_tell_where_its_server_runs_from_another_cgroup_namespace(host, cgroups):
+    # Run in a container, staymux sees its server by a path from the container's cgroup: /, /.. or /../.., which may
+    # still end in staymux.slice but says nothing of where the server runs.
+    host.started("alpha")
+    host.cgroups(cgroups)
+    result = host.run("-l")
+    assert result.returncode == 0
+    assert result.stderr == (
+        f"staymux: cannot tell which cgroup the server (PID {host.server_pid()}) runs in, so cannot check that it"
+        " runs in staymux.slice.\n  If this runs in a container or sandbox, run staymux -l outside it.\n"
+    )
 
 
 # --- staymux -l ------------------------------------------------------------------------------------------------------

@@ -29,7 +29,8 @@ STAYMUX = HOST / "staymux"
 SCRIPT = HOST.parent.parent / "staymux"
 BASH = shutil.which("bash") or "/bin/bash"
 UID = os.getuid()
-ME = subprocess.run(["id", "-un"], capture_output=True, text=True, check=False).stdout.strip()  # as staymux finds it
+_ID = subprocess.run(["id", "-un"], capture_output=True, text=True, check=False)
+ME = _ID.stdout.strip() if _ID.returncode == 0 else ""  # without a passwd entry, id prints the UID and fails
 RUN = Path(f"/run/user/{UID}")  # where staymux always looks; the sandbox's /run is its own
 SOCK = RUN / "staymux.sock"
 XDG_FOLDERS = ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME")
@@ -446,15 +447,21 @@ def test_staymux_name_refuses_a_name_it_cannot_create(host, name):
 
 @pytest.mark.parametrize(
     "kinds",
-    [("own", "else", "missing", "own"), ("else", "missing", "own", "else"), ("missing", "own", "else", "missing")],
+    [
+        ("own", "else", "missing", "else"),
+        ("missing", "own", "else", "missing"),
+        ("else", "missing", "own", "else"),
+        ("missing", "else", "else", "own"),
+    ],
     ids=lambda kinds: "-".join(kinds),
 )
 @pytest.mark.skipif(not ME, reason="needs a passwd entry for the user running the tests, as staymux reads it")
 def test_the_sessions_get_a_login_s_own_environment_whatever_staymux_inherited(host, tmp_path, kinds):
     # After `su -m` or `sudo -E`, the caller's XDG_CONFIG_HOME would give the server their tmux.conf, and the others
     # would give plugins their saved files, such as tmux-resurrect's sessions under XDG_DATA_HOME. Their runtime
-    # directory and bus would lead systemctl to their manager, and USER and LOGNAME would name them. Each run mixes
-    # folders of our own, someone else's and missing ones, so that each variable is judged by its own folder.
+    # directory and bus would lead systemctl to their manager, and USER and LOGNAME would name them. Each run gives
+    # one variable a folder of our own and the others someone else's or missing ones, so that a variable judged by
+    # another's folder fails.
     inherited, expected = {}, {}
     for variable, kind in zip(XDG_FOLDERS, kinds):
         folder = {"own": tmp_path / variable, "else": Path("/usr"), "missing": tmp_path / "missing" / variable}[kind]

@@ -266,10 +266,9 @@ def test_ensure_linger_names_a_missing_busctl(tmp_path):
 
 # --- starting the server -------------------------------------------------------
 
-# Stand in for systemd: systemd-run records the scope it was asked for and runs its command in place of
-# one, systemctl logs what it is asked, and loginctl says lingering is on.
+# Stand in for systemd: systemd-run runs its command in place of a scope, systemctl logs what it is asked, and
+# loginctl says lingering is on.
 STUB_SYSTEMD_RUN = r"""#!/bin/bash
-for arg; do [[ $arg != --unit=* ]] || printf '%s\n' "${arg#--unit=}" >"$SCOPE_LOG"; done
 while [[ $# -gt 0 && $1 != tmux ]]; do shift; done
 exec "$@"
 """
@@ -289,8 +288,7 @@ def start_server(tmp_path, config, then=None, paths=PATHS):
     """Run start_server with START_TIMEOUT=1, a real tmux and this ~/.tmux.conf, on a socket of its own.
 
     Set the paths as in paths. Call then with the socket and the environment, if given, before listing the
-    sessions. Return the result, the seconds it took, the scope systemd-run was asked for, what systemctl
-    was asked, and the sessions.
+    sessions. Return the result, the seconds it took, what systemctl was asked, and the sessions.
     """
     env = stubbed_env(
         tmp_path, systemd_run=STUB_SYSTEMD_RUN, systemctl=STUB_SYSTEMCTL_LOG, loginctl=STUB_LOGINCTL_LINGER_ON
@@ -305,7 +303,6 @@ def start_server(tmp_path, config, then=None, paths=PATHS):
     env.update(
         HOME=str(home),
         STUB_LOG=str(tmp_path / "systemctl.log"),
-        SCOPE_LOG=str(tmp_path / "scope"),
         XDG_RUNTIME_DIR=str(sock_dir),
     )
     try:
@@ -326,15 +323,8 @@ def start_server(tmp_path, config, then=None, paths=PATHS):
         subprocess.run(["pkill", "-KILL", "-f", str(sock)], check=False)
         subprocess.run(["pkill", "-KILL", "-f", "sleep 58.7"], check=False)  # the blocking config's job
         subprocess.run(["pkill", "-KILL", "-f", "sleep 2.7"], check=False)  # the slow config's job
-    scope_log = tmp_path / "scope"
     systemctl_log = tmp_path / "systemctl.log"
-    return (
-        result,
-        took,
-        scope_log.read_text().strip() if scope_log.exists() else "",
-        systemctl_log.read_text().splitlines() if systemctl_log.exists() else [],
-        sessions,
-    )
+    return result, took, systemctl_log.read_text().splitlines() if systemctl_log.exists() else [], sessions
 
 
 pytestmark_tmux = pytest.mark.skipif(not shutil.which("tmux"), reason="native tmux required")
@@ -347,7 +337,7 @@ def test_start_server_stops_waiting_for_a_configuration_that_never_finishes_load
     # and its lock, for as long. The config may already have started work (restored panes, say), so the
     # server is left running and the message says how to stop it.
     config = "run-shell \"trap '' TERM; exec sleep 58.7\"\n"
-    result, took, _, systemctl, _ = start_server(tmp_path, config)
+    result, took, systemctl, _ = start_server(tmp_path, config)
     assert result.returncode == 1
     assert "did not finish starting within 1s" in result.stderr, result.stderr
     assert "If it is stuck, stop it with: staymux -k all" in result.stderr, result.stderr
@@ -370,7 +360,7 @@ def test_start_server_lets_a_slow_configuration_finish_starting_after_it_stops_w
             pass
         time.sleep(3)  # the config's sleep has ended by now, so its client has created the session
 
-    result, _, _, _, sessions = start_server(tmp_path, config, then=another_client_meanwhile)
+    result, _, _, sessions = start_server(tmp_path, config, then=another_client_meanwhile)
     assert "did not finish starting within 1s" in result.stderr, result.stderr
     assert loads.read_text().splitlines() == ["loaded"]
     assert sessions == ["first"]
@@ -380,7 +370,7 @@ def test_start_server_lets_a_slow_configuration_finish_starting_after_it_stops_w
 def test_start_server_does_not_start_a_server_it_cannot_record_as_starting(tmp_path):
     # Without the record a later run would not wait for it, should it take longer than START_TIMEOUT.
     paths = PATHS.replace("$XDG_RUNTIME_DIR/staymux.starting", "$XDG_RUNTIME_DIR/missing/staymux.starting")
-    result, _, _, _, sessions = start_server(tmp_path, "", paths=paths)
+    result, _, _, sessions = start_server(tmp_path, "", paths=paths)
     assert result.returncode == 1
     assert "cannot record the start of the new tmux server" in result.stderr, result.stderr
     assert "could not start the tmux server" in result.stderr, result.stderr

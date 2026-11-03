@@ -44,6 +44,9 @@ readonly TMUX_TIMEOUT=10        # seconds to wait for a tmux client command
 # and hybrid hosts, the unified one on cgroup v2 hosts. Tests point it at a
 # tree of their own.
 CGROUP_ROOTS=(/sys/fs/cgroup/systemd /sys/fs/cgroup/unified /sys/fs/cgroup)
+# Where pid_cgroup reads which cgroups a process runs in, as the kernel shows
+# them in /proc/PID/cgroup. Tests point it at files of their own.
+CGROUP_FILES=/proc
 # The initial PID namespace, which the kernel always numbers the same
 # (PROC_PID_INIT_INO); tests stand their own in for it.
 INIT_PID_NS='pid:[4026531836]'
@@ -259,7 +262,7 @@ pid_cgroup() {
             *:name=systemd:*) PID_CGROUP=${line#*:name=systemd:}; break ;;
             0::*) PID_CGROUP=${line#0::} ;;
         esac
-    done 2>/dev/null <"/proc/$1/cgroup"
+    done 2>/dev/null <"$CGROUP_FILES/$1/cgroup"
     # Read from another cgroup namespace (unshare --cgroup), the path is
     # relative to that namespace's root: "/" or "/../...", which says nothing
     # about the slice.

@@ -244,6 +244,7 @@ class Host:
         command += f"; echo $? >{shlex.quote(str(status))}"
         created = self.tmux("new-window", "-t", f"={session}:", command)
         assert created.returncode == 0, created.stderr
+
         def ended():
             if status.exists() and status.read_text().endswith("\n"):
                 return True
@@ -455,7 +456,10 @@ def test_staymux_turns_lingering_on_before_it_starts_a_server(host):
     me = subprocess.run(["id", "-un"], capture_output=True, text=True, check=True).stdout.strip()
     status, shown = terminal.finish()
     assert status == 0, shown
-    assert f"staymux: enabling lingering for {me} so that sessions survive logout (loginctl enable-linger {UID}).\n" in shown
+    assert (
+        f"staymux: enabling lingering for {me} so that sessions survive logout (loginctl enable-linger {UID}).\n"
+        in shown
+    )
     assert (host.state / "linger").read_text().strip() == str(UID)
 
 

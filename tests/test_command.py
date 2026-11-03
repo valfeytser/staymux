@@ -90,12 +90,12 @@ def gone_pid():
 class Terminal:
     """A run of staymux on a terminal of its own, 80 columns by 24 lines, read as the user would see it."""
 
-    def __init__(self, host, args, env):
+    def __init__(self, host, argv, env):
         self.host = host
         self.pid, self.fd = pty.fork()
         if self.pid == 0:
             try:
-                os.execve(str(STAYMUX), [str(STAYMUX), *args], env)
+                os.execve(argv[0], argv, env)
             finally:
                 os._exit(127)
         fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
@@ -207,9 +207,9 @@ class Host:
             check=False,
         )
 
-    def terminal(self, *args, **env_changes):
-        """Start staymux on a terminal of its own."""
-        terminal = Terminal(self, args, self.env(**env_changes))
+    def terminal(self, *args, command=(str(STAYMUX),), **env_changes):
+        """Start staymux, or the command given, on a terminal of its own."""
+        terminal = Terminal(self, [*command, *args], self.env(**env_changes))
         self.terminals.append(terminal)
         return terminal
 
@@ -232,10 +232,11 @@ class Host:
         status, shown = terminal.finish()
         assert status == 0, shown
 
-    def in_pane(self, session, *args):
+    def in_pane(self, session, *args, ends_server=False):
         """Run staymux from a new window in session, as from a shell in one of its panes.
 
-        Return its exit status, what it printed and what it printed as errors.
+        Return its exit status, what it printed and what it printed as errors. With ends_server, staymux is to end
+        the server and the pane with it, so its status is None if the pane has gone by then.
         """
         self.panes += 1
         out, err, status = (self.state / f"pane{self.panes}.{part}" for part in ("out", "err", "status"))
@@ -243,9 +244,14 @@ class Host:
         command += f"; echo $? >{shlex.quote(str(status))}"
         created = self.tmux("new-window", "-t", f"={session}:", command)
         assert created.returncode == 0, created.stderr
-        ended = wait_until(lambda: status.exists() and status.read_text().endswith("\n"), 20)
-        assert ended, f"staymux did not end in the pane within 20s:\n{out.read_text()}{err.read_text()}"
-        return int(status.read_text()), out.read_text(), err.read_text()
+        def ended():
+            if status.exists() and status.read_text().endswith("\n"):
+                return True
+            return ends_server and self.tmux("has-session").returncode != 0
+
+        assert wait_until(ended, 20), f"staymux did not end in the pane within 20s:\n{out.read_text()}{err.read_text()}"
+        code = status.read_text() if status.exists() else ""
+        return int(code) if code.endswith("\n") else None, out.read_text(), err.read_text()
 
     def calls(self, command):
         """The calls staymux made to one of the stubbed commands, each as its arguments."""
@@ -336,3 +342,232 @@ def test_staymux_refuses_to_run_inside_another_tmux(host):
         "  Detach from it first (prefix key, then d), or use a terminal outside tmux, then run staymux again.\n"
     )
     assert host.sessions() == []
+
+
+# --- staymux and staymux NAME --------------------------------------------------------------------------------------
+
+
+def test_staymux_starts_its_server_in_a_scope_of_staymux_slice(host):
+    # The scope is what outlives logout. SendSIGHUP: stopping it also ends interactive shells, which ignore SIGTERM.
+    terminal = host.terminal()
+    assert terminal.attached() == HOSTNAME, terminal.text()
+    [run] = host.calls("systemd-run")
+    words = run.split()
+    unit = next(word for word in words if word.startswith("--unit="))
+    assert unit.startswith("--unit=staymux-") and unit.endswith(".scope")
+    assert words[: words.index(unit)] == ["--user", "--scope", "--quiet"]
+    assert run.partition(f"{unit} ")[2] == (
+        "--slice=staymux.slice --description=staymux tmux server --property=SendSIGHUP=yes "
+        f"tmux -S {SOCK} new-session -d -s {HOSTNAME}"
+    )
+    assert terminal.finish()[0] == 0
+
+
+def test_staymux_name_creates_that_session_beside_the_others_and_attaches_to_it(host):
+    host.started("alpha")
+    server = host.server_pid()
+    terminal = host.terminal("beta")
+    assert terminal.attached() == "beta", terminal.text()
+    assert (host.sessions(), host.server_pid()) == (["alpha", "beta"], server)
+    assert len(host.calls("systemd-run")) == 1  # the one server
+    assert terminal.finish()[0] == 0
+
+
+def test_staymux_name_attaches_to_a_session_that_is_already_there(host):
+    host.started("alpha")
+    host.started("beta")
+    terminal = host.terminal("alpha")
+    assert terminal.attached() == "alpha", terminal.text()
+    assert host.sessions() == ["alpha", "beta"]
+    assert terminal.finish()[0] == 0
+
+
+def test_staymux_lists_several_sessions_rather_than_pick_one(host):
+    host.started("alpha")
+    host.started("beta")
+    result = host.run()
+    assert (result.returncode, result.stderr) == (0, "")
+    lines = result.stdout.splitlines()
+    assert lines[:2] == ["Several staymux sessions are running:", ""]
+    assert lines[2] == "  NAME   WINDOWS  CLIENTS  CREATED"
+    assert [line.split()[:3] for line in lines[3:5]] == [["alpha", "1", "0"], ["beta", "1", "0"]]
+    assert lines[5:] == ["", "Attach to one with: staymux NAME"]
+
+
+@pytest.mark.parametrize("name", ["-x", "a.b", "all", "x" * 65], ids=["leading-dash", "dot", "reserved", "too-long"])
+def test_staymux_name_refuses_a_name_it_cannot_create(host, name):
+    result = host.run("--", name)
+    assert (result.returncode, result.stdout) == (2, "")
+    assert f"staymux: invalid session name '{name}'" in result.stderr
+    assert host.calls("systemd-run") == []
+
+
+@pytest.mark.parametrize("variable", ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"])
+@pytest.mark.parametrize(
+    ("folder", "kept"),
+    [("own", True), ("/usr", False), ("missing", False)],
+    ids=["own-folder", "someone-elses-folder", "missing-folder"],
+)
+def test_the_sessions_get_a_login_s_own_environment_whatever_staymux_inherited(host, tmp_path, variable, folder, kept):
+    # After `su -m` or `sudo -E`, the caller's XDG_CONFIG_HOME would give the server their tmux.conf, and the others
+    # would give plugins their saved files, such as tmux-resurrect's sessions under XDG_DATA_HOME. Their runtime
+    # directory and bus would lead systemctl to their manager, and USER and LOGNAME would name them.
+    folder = {"own": str(tmp_path), "missing": str(tmp_path / "missing")}.get(folder, folder)
+    inherited = {variable: folder, "USER": "someone", "LOGNAME": "someone"}
+    inherited.update(XDG_RUNTIME_DIR="/run/user/0", DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/0/bus")
+    terminal = host.terminal("alpha", **inherited)
+    assert terminal.attached() == "alpha", terminal.text()
+    pane = host.tmux("display-message", "-p", "-t", "=alpha:", "#{pane_pid}").stdout.strip()
+    env = dict(entry.split("=", 1) for entry in Path(f"/proc/{pane}/environ").read_text().split("\0") if entry)
+    me = subprocess.run(["id", "-un"], capture_output=True, text=True, check=True).stdout.strip()
+    assert env.get(variable) == (folder if kept else None)
+    assert (env["USER"], env["LOGNAME"], env["HOME"]) == (me, me, str(host.home))
+    assert env["XDG_RUNTIME_DIR"] == str(RUN)
+    assert env["DBUS_SESSION_BUS_ADDRESS"] == f"unix:path={RUN}/bus"
+    assert terminal.finish()[0] == 0
+
+
+@pytest.mark.parametrize(
+    "inherited", [{"SHELLOPTS": "noclobber"}, {"TMPDIR": "/proc"}], ids=["noclobber", "unwritable-tmpdir"]
+)
+def test_staymux_starts_and_attaches_whatever_the_caller_s_shell_settings(host, inherited):
+    # Both reach staymux through `su -m` or `sudo -E`.
+    terminal = host.terminal("alpha", **inherited)
+    assert terminal.attached() == "alpha", terminal.text()
+    assert terminal.finish()[0] == 0
+
+
+def test_staymux_reports_a_scope_that_systemd_refuses(host):
+    (host.state / "run-fails").touch()
+    terminal = host.terminal("alpha")
+    assert terminal.attached() is None
+    status, shown = terminal.finish()
+    assert status == 1
+    assert "Failed to start transient scope unit: Access denied\n" in shown, shown
+    assert "staymux: could not start the tmux server (see the error above).\n" in shown, shown
+    assert host.sessions() == []
+
+
+def test_staymux_turns_lingering_on_before_it_starts_a_server(host):
+    (host.state / "linger").unlink()
+    terminal = host.terminal("alpha")
+    assert terminal.attached() == "alpha", terminal.text()
+    me = subprocess.run(["id", "-un"], capture_output=True, text=True, check=True).stdout.strip()
+    status, shown = terminal.finish()
+    assert status == 0, shown
+    assert f"staymux: enabling lingering for {me} so that sessions survive logout (loginctl enable-linger {UID}).\n" in shown
+    assert (host.state / "linger").read_text().strip() == str(UID)
+
+
+def test_staymux_does_not_wait_for_a_password_nobody_can_give_for_lingering(host):
+    # loginctl would ask through any polkit agent, its own or one already running, even with --no-ask-password,
+    # and hold the lock until someone typed a password into this terminal.
+    (host.state / "linger").unlink()
+    (host.state / "policy").write_text("admin\n")
+    terminal = host.terminal("alpha")
+    assert terminal.attached(timeout=5) is None, "staymux attached"
+    status, shown = terminal.finish()
+    assert status == 1
+    assert "Interactive authentication required" in shown, shown
+    assert "staymux: lingering is off for" in shown and "so a new server would be killed at logout" in shown, shown
+    assert f"Or ask an administrator to run: sudo loginctl enable-linger {UID}\n" in shown, shown
+    assert host.sessions() == []
+
+
+def test_staymux_as_it_is_refuses_a_server_whose_cgroup_it_cannot_see(host):
+    # The plain file, without tests/host/staymux standing in for the kernel: in a cgroup namespace such as this
+    # sandbox's, no process shows which unit it runs in, so staymux cannot check that its server outlives logout.
+    terminal = host.terminal("alpha", command=(shutil.which("bash"), str(HOST.parent.parent / "staymux")))
+    assert terminal.attached() is None
+    status, shown = terminal.finish()
+    assert status == 1
+    assert "so cannot check that it runs in staymux.slice and outlives logout.\n" in shown, shown
+    assert "  If this runs in a container or sandbox, run staymux outside it.\n" in shown, shown
+
+
+# --- staymux -l ------------------------------------------------------------------------------------------------------
+
+
+def test_staymux_l_says_when_no_session_runs(host):
+    result = host.run("-l")
+    assert (result.returncode, result.stdout, result.stderr) == (
+        0,
+        "No staymux sessions are running. Start one with: staymux [NAME]\n",
+        "",
+    )
+
+
+def test_staymux_l_lists_the_sessions_with_their_attached_clients(host):
+    host.started("alpha")
+    terminal = host.terminal("beta")
+    assert terminal.attached() == "beta", terminal.text()
+    result = host.run("-l")
+    assert (result.returncode, result.stderr) == (0, "")
+    lines = result.stdout.splitlines()
+    assert lines[0] == "  NAME   WINDOWS  CLIENTS  CREATED"
+    assert [line[:2] + " ".join(line.split()[:3]) for line in lines[1:]] == ["  alpha 1 0", "  beta 1 1"]
+    assert terminal.finish()[0] == 0
+
+
+def test_staymux_l_in_a_pane_marks_its_session(host):
+    host.started("alpha")
+    terminal = host.terminal("beta")
+    assert terminal.attached() == "beta", terminal.text()
+    status, listed, errors = host.in_pane("beta", "-l")
+    assert (status, errors) == (0, "")
+    assert [line[:7] for line in listed.splitlines()[1:]] == ["  alpha", "* beta "]
+    assert terminal.finish()[0] == 0
+
+
+# --- staymux -k ------------------------------------------------------------------------------------------------------
+
+
+def test_staymux_k_kills_one_session_and_leaves_the_others(host):
+    host.started("alpha")
+    host.started("beta")
+    result = host.run("-k", "alpha")
+    assert (result.returncode, result.stdout, result.stderr) == (0, "Killed session 'alpha'.\n", "")
+    assert host.sessions() == ["beta"]
+
+
+def test_staymux_k_says_when_the_last_session_ends_the_server(host):
+    host.started("alpha")
+    result = host.run("-k", "alpha")
+    assert (result.returncode, result.stderr) == (0, "")
+    assert result.stdout == "Killed session 'alpha'.\nThat was the last session, so the staymux server has exited.\n"
+    assert host.sessions() == []
+
+
+def test_staymux_k_names_a_session_that_is_not_there(host):
+    host.started("alpha")
+    result = host.run("-k", "alph")  # names are matched exactly, not by prefix as tmux would
+    assert (result.returncode, result.stdout) == (1, "")
+    assert result.stderr == "staymux: no session named 'alph'.\n  See the running sessions with: staymux -l\n"
+    assert host.sessions() == ["alpha"]
+
+
+def test_staymux_k_all_kills_every_session_and_stops_the_slice(host):
+    host.started("alpha")
+    host.started("beta")
+    result = host.run("-k", "all")
+    assert (result.returncode, result.stdout, result.stderr) == (0, "Killed 2 staymux session(s) and the server.\n", "")
+    assert host.sessions() == []
+    assert "--user stop staymux.slice" in host.calls("systemctl")
+
+
+def test_staymux_k_all_cleans_up_the_slice_when_no_server_runs(host):
+    result = host.run("-k", "all")
+    assert (result.returncode, result.stderr) == (0, "")
+    assert result.stdout == "No staymux server was running; cleaned up staymux.slice.\n"
+    assert "--user stop staymux.slice" in host.calls("systemctl")
+
+
+def test_staymux_k_all_in_a_pane_queues_the_stop_and_ends_the_server_with_this_pane(host):
+    # This pane is among what stops, so systemd is left to finish the stop after staymux has gone.
+    terminal = host.terminal("alpha")
+    assert terminal.attached() == "alpha", terminal.text()
+    _, said, errors = host.in_pane("alpha", "-k", "all", ends_server=True)
+    assert (said, errors) == ("Stopping all staymux sessions, including this one.\n", "")
+    assert host.sessions() == []
+    assert "--user stop --no-block staymux.slice" in host.calls("systemctl")
+    assert "--user stop staymux.slice" not in host.calls("systemctl")

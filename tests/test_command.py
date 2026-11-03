@@ -640,10 +640,10 @@ def test_staymux_l_cannot_tell_where_its_server_runs_from_another_cgroup_namespa
     )
 
 
-def test_staymux_as_it_is_reads_the_kernel_s_cgroup_files_not_ones_it_inherited(host, tmp_path):
+def test_staymux_as_it_is_ignores_cgroup_files_it_inherited(host, tmp_path):
     # The plain file, given a CGROUP_FILES whose forged file puts its server in a scope of its own. It reads the
-    # kernel's instead, which name no unit in this sandbox's cgroup namespace and the runner's own cgroup without one,
-    # so it never names the forged scope.
+    # kernel's files instead, which name no unit in the sandbox's cgroup namespace, or the runner's own cgroup where
+    # the sandbox has none, so it never names the forged scope. test_start.py checks which files it does read.
     host.started("alpha")
     forged = tmp_path / "forged"
     server = forged / str(host.server_pid())

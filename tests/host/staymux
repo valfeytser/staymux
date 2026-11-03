@@ -2,16 +2,16 @@
 # Runs staymux as the command it is, for tests/test_command.py: every decision main makes, from the arguments
 # and the environment given, with this folder's stubs on PATH standing in for systemd.
 #
-# Only one fact needs more than a stub. The test sandbox has a cgroup namespace of its own, where the kernel
-# shows every process at its root (0::/), so staymux cannot tell which unit its server runs in. So the kernel's
-# /proc/PID/cgroup is stood in for below: each file staymux's own pid_cgroup reads is first written in a folder of
-# this run's own in the test's folder, proc.PID. A process started through the systemd-run stub, or forked from
-# one, runs in the scope that stub was asked for, which it hands down in STAYMUX_TEST_CGROUP as a fork inherits its
-# cgroup; any other runs in a login session's scope. The file shows that cgroup as $STAYMUX_TEST_HOST/cgroups lays
-# it out, each "{cgroup}" in it standing for the cgroup, as a host with cgroup v1 or in another cgroup namespace
-# would show it; without that file, as cgroup v2 shows it (0::{cgroup}). The cgroup tree that report_leftovers
-# reads is the test's own, so a staymux.slice of the machine running the tests never shows. The rest of staymux
-# runs as it is.
+# Only one fact needs more than a stub. The test sandbox makes a cgroup namespace of its own where it can, where the
+# kernel shows every process at its root (0::/), so staymux cannot tell which unit its server runs in. So the
+# kernel's /proc/PID/cgroup is stood in for below: each file staymux's own pid_cgroup reads is first written in a
+# folder of this run's own in the test's folder, named proc.N after the stand-in's own PID. A process started
+# through the systemd-run stub, or forked from one, runs in the scope that stub was asked for, which it hands down
+# in STAYMUX_TEST_CGROUP as a fork inherits its cgroup; any other runs in a login session's scope. The file shows
+# that cgroup as $STAYMUX_TEST_HOST/cgroups lays it out, each "{cgroup}" in it standing for the cgroup, as a host
+# with cgroup v1 or in another cgroup namespace would show it; without that file, as cgroup v2 shows it
+# (0::{cgroup}). The cgroup tree that report_leftovers reads is the test's own, so a staymux.slice of the machine
+# running the tests never shows. The rest of staymux runs as it is.
 #
 # STAYMUX_TEST_HOST names the test's folder of host state; see tests/test_command.py.
 
@@ -28,16 +28,21 @@ fi
 
 CGROUP_ROOTS=("$STAYMUX_TEST_HOST/cgroup")
 CGROUP_FILES=$STAYMUX_TEST_HOST/proc.$$   # this run's own, so that no other run rewrites a file while it reads it
+if [[ ${CGROUP_ROOTS[*]} != "$STAYMUX_TEST_HOST/cgroup" || $CGROUP_FILES != "$STAYMUX_TEST_HOST/proc.$$" ]]; then
+    echo 'tests/host/staymux: staymux keeps CGROUP_ROOTS or CGROUP_FILES from being set here; update this stand-in' >&2
+    exit 125
+fi
 
 eval "staymux_$(declare -f pid_cgroup)"   # staymux's own reader, as staymux_pid_cgroup
 
-# The stand-in below works only while that reader reads CGROUP_FILES/PID/cgroup, so check that it reads one there.
-if ! { mkdir -p "$CGROUP_FILES/0" && echo 0::/written-here >|"$CGROUP_FILES/0/cgroup"; } 2>/dev/null ||
-    ! staymux_pid_cgroup 0 || [[ $PID_CGROUP != /written-here ]]; then
-    echo 'tests/host/staymux: pid_cgroup no longer reads CGROUP_FILES/PID/cgroup as set here; update this stand-in' >&2
+# The stand-in below works only while that reader reads CGROUP_FILES/PID/cgroup, so check that it reads one there,
+# for this live process.
+mkdir -p "$CGROUP_FILES/$$" && echo 0::/written-here >|"$CGROUP_FILES/$$/cgroup" || exit 125
+if ! staymux_pid_cgroup $$ || [[ $PID_CGROUP != /written-here ]]; then
+    echo 'tests/host/staymux: pid_cgroup no longer reads CGROUP_FILES/PID/cgroup; update this stand-in' >&2
     exit 125
 fi
-rm -r "$CGROUP_FILES/0"
+rm -r "${CGROUP_FILES:?}/$$"
 
 pid_cgroup() {
     local entry layout='0::{cgroup}' cgroup=/user.slice/user-$EUID.slice/session-1.scope

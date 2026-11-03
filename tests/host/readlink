@@ -5,10 +5,13 @@
 # gives the sandbox's own. Any other call goes to the real readlink.
 host=${STAYMUX_TEST_HOST:?}
 real() {
-    local dir IFS=:
-    for dir in $PATH; do
-        [[ $dir -ef ${BASH_SOURCE[0]%/*} || ! -x $dir/readlink ]] || { printf '%s\n' "$dir/readlink"; return; }
+    local dir dirs=()
+    IFS=: read -ra dirs <<<"$PATH"
+    for dir in "${dirs[@]}"; do
+        [[ $dir -ef ${BASH_SOURCE[0]%/*} || ! -x $dir/readlink ]] || { printf '%s\n' "$dir/readlink"; return 0; }
     done
+    echo 'readlink stub: no other readlink on PATH' >&2
+    return 1
 }
 if [[ $* == /proc/self/ns/pid ]]; then
     case $(cat "$host/pid-ns" 2>/dev/null) in
@@ -16,4 +19,5 @@ if [[ $* == /proc/self/ns/pid ]]; then
         unknown) exit 1 ;;
     esac
 fi
-exec "$(real)" "$@"
+readlink=$(real) || exit 1
+exec "$readlink" "$@"

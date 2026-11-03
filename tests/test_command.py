@@ -1,0 +1,338 @@
+"""Run staymux as a command, as its user would, and check what they see: attaching, listing, the messages.
+
+Each test gets a host of its own: a private /run/user/$UID, a home with a tmux.conf that pins what panes run, and
+tests/host first on PATH, where stubs stand in for systemd, logind and the PID namespace, and tests/host/staymux runs
+staymux itself (it says why it stands in for the kernel's cgroups too). tmux is real. The stubs keep their state in
+the test's host folder: calls (every call), unexpected (calls staymux has no business making, which fail the test),
+linger, policy, run-fails, pid-ns and jobs, each described in the stub that reads it.
+"""
+
+import fcntl
+import os
+import pty
+import shlex
+import shutil
+import signal
+import struct
+import subprocess
+import termios
+import threading
+import time
+from pathlib import Path
+
+import pytest
+
+pytestmark = pytest.mark.skipif(not shutil.which("tmux"), reason="native tmux required")
+
+HOST = Path(__file__).resolve().parent / "host"
+STAYMUX = HOST / "staymux"
+UID = os.getuid()
+RUN = Path(f"/run/user/{UID}")  # where staymux always looks; the sandbox's /run is its own
+SOCK = RUN / "staymux.sock"
+HOSTNAME = "testhost"  # bash keeps the one it is given, so no message names the machine running the tests
+# What panes run, pinned: a first pane waits, and a command given to new-window runs in sh, not the login shell.
+TMUX_CONF = "set -g default-shell /bin/sh\nset -g default-command 'exec sleep 3600'\n"
+
+
+def wait_until(condition, timeout, step=0.02):
+    """Call condition until it returns something true, and return that, or None after timeout seconds."""
+    deadline = time.monotonic() + timeout
+    while True:
+        found = condition()
+        if found or time.monotonic() > deadline:
+            return found
+        time.sleep(step)
+
+
+def ancestors():
+    """This process and the ones it descends from."""
+    pids, pid = set(), os.getpid()
+    while pid > 0 and pid not in pids:
+        pids.add(pid)
+        status = Path(f"/proc/{pid}/status").read_text()
+        pid = int(next(line.split()[1] for line in status.splitlines() if line.startswith("PPid:")))
+    return pids
+
+
+def sweep():
+    """End every process in the sandbox but this one and its ancestors: whatever a test started, servers included.
+
+    The sandbox has a PID namespace of its own, so nothing else runs in it.
+    """
+    keep = ancestors()
+    others = [int(entry.name) for entry in Path("/proc").iterdir() if entry.name.isdigit()]
+    others = [pid for pid in others if pid not in keep]
+    for pid in others:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    def gone():
+        for pid in others:
+            try:
+                if Path(f"/proc/{pid}/stat").read_text().rpartition(")")[2].split()[0] != "Z":
+                    return False
+            except (FileNotFoundError, ProcessLookupError):
+                pass
+        return True
+
+    wait_until(gone, 5)
+
+
+def gone_pid():
+    """The PID of a process that has ended."""
+    process = subprocess.Popen(["true"])
+    process.wait()
+    return process.pid
+
+
+class Terminal:
+    """A run of staymux on a terminal of its own, 80 columns by 24 lines, read as the user would see it."""
+
+    def __init__(self, host, args, env):
+        self.host = host
+        self.pid, self.fd = pty.fork()
+        if self.pid == 0:
+            try:
+                os.execve(str(STAYMUX), [str(STAYMUX), *args], env)
+            finally:
+                os._exit(127)
+        fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
+        self.shown = bytearray()
+        self.reader = threading.Thread(target=self._read, daemon=True)
+        self.reader.start()
+        self.status = None
+
+    def _read(self):
+        while True:
+            try:
+                chunk = os.read(self.fd, 65536)
+            except OSError:
+                return
+            if not chunk:
+                return
+            self.shown += chunk
+
+    def _ended(self):
+        if self.status is None:
+            pid, status = os.waitpid(self.pid, os.WNOHANG)
+            if pid:
+                self.status = os.waitstatus_to_exitcode(status)
+        return self.status is not None
+
+    def client(self):
+        """This run's tmux client as tmux lists it: its tty and session, or None while it has none."""
+        # staymux execs tmux attach-session, so the client keeps this run's PID.
+        listed = self.host.tmux("list-clients", "-F", "#{client_pid} #{client_tty} #{session_name}").stdout
+        for line in listed.splitlines():
+            pid, tty, session = line.split(" ", 2)
+            if pid == str(self.pid):
+                return tty, session
+        return None
+
+    def attached(self, timeout=10):
+        """The session this run attached its terminal to, once it has, or None if it ended without attaching."""
+        found = wait_until(lambda: self.client() or (self._ended() and "ended"), timeout)
+        assert found, f"staymux neither attached nor ended within {timeout}s:\n{self.text()}"
+        return None if found == "ended" else found[1]
+
+    def session(self):
+        found = self.client()
+        return found and found[1]
+
+    def finish(self, timeout=10):
+        """Detach this run's client, if it has one, and return its exit status and what it showed."""
+        found = self.client()
+        if found:
+            self.host.tmux("detach-client", "-t", found[0])
+        assert wait_until(self._ended, timeout), f"staymux did not end within {timeout}s:\n{self.text()}"
+        self.reader.join(timeout)
+        return self.status, self.text()
+
+    def text(self):
+        return self.shown.decode(errors="replace").replace("\r\n", "\n")
+
+    def close(self):
+        if not self._ended():
+            os.kill(self.pid, signal.SIGKILL)
+            wait_until(self._ended, 5)
+        os.close(self.fd)
+
+
+class Host:
+    """The host a test runs staymux on; see the module's docstring."""
+
+    def __init__(self, tmp_path):
+        self.state = tmp_path / "host"
+        (self.state / "cgroup").mkdir(parents=True)
+        (self.state / "linger").write_text(f"{UID}\n")
+        self.pid_namespace("initial")
+        self.home = tmp_path / "home"
+        self.home.mkdir()
+        (self.home / ".tmux.conf").write_text(TMUX_CONF)
+        self.terminals = []
+        self.panes = 0
+
+    def pid_namespace(self, which):
+        """Say which PID namespace staymux runs in: initial, child or unknown (see tests/host/readlink)."""
+        (self.state / "pid-ns").write_text(f"{which}\n")
+
+    def env(self, **changes):
+        """The environment of a login on this host, with the given changes; a change to None unsets a variable."""
+        env = {name: value for name, value in os.environ.items() if not name.startswith(("TMUX", "XDG_"))}
+        env.update(
+            PATH=f"{HOST}{os.pathsep}{os.environ['PATH']}",
+            HOME=str(self.home),
+            HOSTNAME=HOSTNAME,
+            TERM="xterm-256color",
+            STAYMUX_TEST_HOST=str(self.state),
+        )
+        for name, value in changes.items():
+            if value is None:
+                env.pop(name, None)
+            else:
+                env[name] = value
+        return env
+
+    def run(self, *args, **env_changes):
+        """Run staymux without a terminal and return the result."""
+        return subprocess.run(
+            [str(STAYMUX), *args],
+            env=self.env(**env_changes),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+
+    def terminal(self, *args, **env_changes):
+        """Start staymux on a terminal of its own."""
+        terminal = Terminal(self, args, self.env(**env_changes))
+        self.terminals.append(terminal)
+        return terminal
+
+    def tmux(self, *args):
+        """Run a tmux command on staymux's socket, as the user would."""
+        return subprocess.run(
+            ["tmux", "-S", str(SOCK), *args], env=self.env(), capture_output=True, text=True, timeout=10, check=False
+        )
+
+    def sessions(self):
+        return self.tmux("list-sessions", "-F", "#{session_name}").stdout.split()
+
+    def server_pid(self):
+        return int(self.tmux("display-message", "-p", "#{pid}").stdout)
+
+    def started(self, name):
+        """Start session name with staymux, as a user who has since detached from it."""
+        terminal = self.terminal(name)
+        assert terminal.attached() == name, terminal.text()
+        status, shown = terminal.finish()
+        assert status == 0, shown
+
+    def in_pane(self, session, *args):
+        """Run staymux from a new window in session, as from a shell in one of its panes.
+
+        Return its exit status, what it printed and what it printed as errors.
+        """
+        self.panes += 1
+        out, err, status = (self.state / f"pane{self.panes}.{part}" for part in ("out", "err", "status"))
+        command = f"{shlex.join([str(STAYMUX), *args])} >{shlex.quote(str(out))} 2>{shlex.quote(str(err))}"
+        command += f"; echo $? >{shlex.quote(str(status))}"
+        created = self.tmux("new-window", "-t", f"={session}:", command)
+        assert created.returncode == 0, created.stderr
+        ended = wait_until(lambda: status.exists() and status.read_text().endswith("\n"), 20)
+        assert ended, f"staymux did not end in the pane within 20s:\n{out.read_text()}{err.read_text()}"
+        return int(status.read_text()), out.read_text(), err.read_text()
+
+    def calls(self, command):
+        """The calls staymux made to one of the stubbed commands, each as its arguments."""
+        log = self.state / "calls"
+        lines = log.read_text().splitlines() if log.exists() else []
+        return [line.partition(" ")[2] for line in lines if line.partition(" ")[0] == command]
+
+    def close(self):
+        for terminal in self.terminals:
+            terminal.close()
+        sweep()
+        shutil.rmtree(RUN, ignore_errors=True)
+        unexpected = self.state / "unexpected"
+        assert not unexpected.exists(), "staymux made calls no stub expects:\n" + unexpected.read_text()
+
+
+@pytest.fixture
+def host(tmp_path):
+    shutil.rmtree(RUN, ignore_errors=True)
+    RUN.mkdir(mode=0o700, parents=True)
+    Path("/run/systemd/system").mkdir(parents=True, exist_ok=True)
+    host = Host(tmp_path)
+    try:
+        yield host
+    finally:
+        host.close()
+
+
+# --- a shell whose $TMUX names staymux's socket ---------------------------------------------------------------------
+
+
+def test_a_shell_left_with_the_tmux_of_a_server_that_has_gone_attaches_to_a_new_one(host):
+    # After a crash a shell outside staymux can still carry $TMUX naming its socket. In the initial PID namespace a
+    # server that isn't visible has gone, so staymux acts as it would outside tmux, rather than list sessions to
+    # switch to from a pane that isn't there.
+    terminal = host.terminal(TMUX=f"{SOCK},{gone_pid()},0", TMUX_PANE="%0")
+    assert terminal.attached() == HOSTNAME, terminal.text()
+    status, shown = terminal.finish()
+    assert status == 0, shown
+    assert f"[detached (from session {HOSTNAME})]" in shown
+    assert "Switch with" not in shown
+
+
+@pytest.mark.parametrize("pid_namespace", ["child", "unknown"])
+def test_a_shell_in_another_pid_namespace_trusts_the_tmux_of_a_server_it_cannot_see(host, pid_namespace):
+    # There, as in a sandbox started from a pane, the server may run outside, out of sight, so the shell still counts
+    # as inside staymux: plain staymux lists the sessions to switch to, none here, rather than start a second server.
+    host.pid_namespace(pid_namespace)
+    result = host.run(TMUX=f"{SOCK},{gone_pid()},0", TMUX_PANE="%0")
+    assert (result.returncode, result.stderr) == (0, "")
+    assert result.stdout == "  NAME  WINDOWS  CLIENTS  CREATED\n\nSwitch with: staymux NAME\n"
+    assert host.sessions() == []
+
+
+def test_staymux_in_a_pane_lists_the_sessions_marking_its_own_and_switches_to_another(host):
+    terminal = host.terminal("alpha")
+    assert terminal.attached() == "alpha", terminal.text()
+    status, listed, errors = host.in_pane("alpha")
+    assert (status, errors) == (0, "")
+    lines = listed.splitlines()
+    assert lines[0] == "  NAME   WINDOWS  CLIENTS  CREATED"
+    assert [line[:8] for line in lines[1:]] == ["* alpha ", "", "Switch w"]
+    assert lines[-1] == "Switch with: staymux NAME"
+
+    assert host.in_pane("alpha", "beta") == (0, "", "")
+    assert (terminal.session(), host.sessions()) == ("beta", ["alpha", "beta"])
+    status, shown = terminal.finish()
+    assert status == 0, shown
+    assert "[detached (from session beta)]" in shown
+
+
+def test_a_process_that_only_inherited_the_tmux_of_a_running_server_attaches_as_from_outside(host):
+    # Started from a pane and since moved away, such as an editor's terminal: switch-client would act on the pane's
+    # client instead, so it counts as outside staymux, and plain staymux attaches to the one session.
+    host.started("alpha")
+    terminal = host.terminal(TMUX=f"{SOCK},{host.server_pid()},0", TMUX_PANE="%0")
+    assert terminal.attached() == "alpha", terminal.text()
+    status, shown = terminal.finish()
+    assert status == 0, shown
+    assert "Switch with" not in shown
+
+
+def test_staymux_refuses_to_run_inside_another_tmux(host):
+    result = host.run(TMUX="/tmp/tmux-1000/default,4242,0", TMUX_PANE="%3")
+    assert (result.returncode, result.stdout) == (1, "")
+    assert result.stderr == (
+        "staymux: this shell runs inside another tmux server (/tmp/tmux-1000/default); staymux does not nest tmux.\n"
+        "  Detach from it first (prefix key, then d), or use a terminal outside tmux, then run staymux again.\n"
+    )
+    assert host.sessions() == []

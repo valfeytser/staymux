@@ -1,0 +1,10 @@
+#!/bin/bash
+# Stands in for logind's lingering setting: on while $STAYMUX_TEST_HOST/linger holds our UID.
+host=${STAYMUX_TEST_HOST:?}
+printf 'loginctl %s\n' "$*" >>"$host/calls"
+if [[ $* != "show-user $EUID --property=Linger --value" ]]; then
+    printf 'loginctl %s\n' "$*" >>"$host/unexpected"
+    echo "loginctl stub: unexpected call: $*" >&2
+    exit 1
+fi
+[[ -e $host/linger && $(<"$host/linger") == "$EUID" ]] && echo yes || echo no

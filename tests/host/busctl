@@ -1,0 +1,26 @@
+#!/bin/bash
+# Stands in for logind's SetUserLinger(uid, enable, interactive) behind busctl, which also allows interaction unless
+# told --allow-interactive-authorization=no (or false, 0, off). Under the policy in $STAYMUX_TEST_HOST/policy,
+# "admin", setting lingering needs a password: a call that allows interaction waits for one on stdin, as a polkit
+# agent would, and any other fails at once. Without one, it sets or clears lingering for that UID.
+host=${STAYMUX_TEST_HOST:?}
+printf 'busctl %s\n' "$*" >>"$host/calls"
+if [[ " $* " != *' org.freedesktop.login1.Manager SetUserLinger ubb '* ]]; then
+    printf 'busctl %s\n' "$*" >>"$host/unexpected"
+    echo "busctl stub: unexpected call: $*" >&2
+    exit 1
+fi
+truthy() { case ${1,,} in 1 | y | yes | true | on) return 0 ;; esac; return 1; }
+header=yes
+for arg; do [[ $arg != --allow-interactive-authorization=* ]] || header=${arg#*=}; done
+uid=${*: -3:1} enable=${*: -2:1} interactive=${*: -1:1}
+if [[ $(cat "$host/policy" 2>/dev/null) != admin ]]; then
+    if truthy "$enable"; then echo "$uid" >"$host/linger"; else rm -f "$host/linger"; fi
+elif truthy "$interactive" || truthy "$header"; then
+    echo 'Password: ' >&2
+    read -r _
+    exit 1
+else
+    echo 'Call failed: Interactive authentication required.' >&2
+    exit 1
+fi

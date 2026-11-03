@@ -1,0 +1,38 @@
+#!/bin/bash
+# Runs staymux as the command it is, for tests/test_command.py: every decision main makes, from the arguments
+# and the environment given, with this folder's stubs on PATH standing in for systemd.
+#
+# Only one fact needs more than a stub. The test sandbox has a cgroup namespace of its own, where the kernel
+# shows every process at its root (0::/), so staymux cannot tell which unit its server runs in. pid_cgroup is
+# replaced below to stand in for the kernel: a process started through the systemd-run stub, or forked from one,
+# runs in the scope that stub was asked for, which it hands down in STAYMUX_TEST_CGROUP as a fork inherits its
+# cgroup; any other runs in a login session's scope. The cgroup tree that report_leftovers reads is the test's
+# own, so a staymux.slice of the machine running the tests never shows. The rest of staymux runs as it is.
+#
+# STAYMUX_TEST_HOST names the test's folder of host state; see tests/test_command.py.
+
+[[ -d ${STAYMUX_TEST_HOST:-} ]] || { echo 'tests/host/staymux: STAYMUX_TEST_HOST names no folder' >&2; exit 125; }
+
+# shellcheck source=../../staymux
+source "${BASH_SOURCE[0]%/*}/../../staymux" || exit 125
+
+# What follows replaces parts of staymux by name, so a rename there must fail here, not pass by testing less.
+if ! declare -F main pid_cgroup >/dev/null || [[ $(declare -p CGROUP_ROOTS 2>/dev/null) != 'declare -a '* ]]; then
+    echo 'tests/host/staymux: staymux no longer has main, pid_cgroup or CGROUP_ROOTS; update this stand-in' >&2
+    exit 125
+fi
+
+CGROUP_ROOTS=("$STAYMUX_TEST_HOST/cgroup")
+
+pid_cgroup() {
+    local entry
+    PID_CGROUP=''
+    [[ -r /proc/$1/environ ]] || return 1
+    PID_CGROUP=/user.slice/user-$EUID.slice/session-1.scope
+    while IFS= read -r -d '' entry; do
+        [[ $entry != STAYMUX_TEST_CGROUP=* ]] || PID_CGROUP=${entry#*=}
+    done 2>/dev/null <"/proc/$1/environ"
+    [[ -e /proc/$1 ]]   # it may have gone while being read
+}
+
+main "$@"

@@ -200,10 +200,10 @@ class Host:
                 env[name] = value
         return env
 
-    def run(self, *args, **env_changes):
-        """Run staymux without a terminal and return the result."""
+    def run(self, *args, command=(str(STAYMUX),), **env_changes):
+        """Run staymux, or the command given, without a terminal and return the result."""
         return subprocess.run(
-            [str(STAYMUX), *args],
+            [*command, *args],
             env=self.env(**env_changes),
             stdin=subprocess.DEVNULL,
             capture_output=True,
@@ -500,6 +500,25 @@ def test_staymux_as_it_is_refuses_a_server_whose_cgroup_it_cannot_see(host):
     assert status == 1
     assert "so cannot check that it runs in staymux.slice and outlives logout.\n" in shown, shown
     assert "  If this runs in a container or sandbox, run staymux outside it.\n" in shown, shown
+
+
+@pytest.mark.parametrize(
+    ("args", "said"),
+    [
+        ([], "Several staymux sessions are running:\n"),
+        (["-k", "alpha"], "Killed session 'alpha'.\n"),
+        (["-l"], "  NAME "),
+    ],
+    ids=["staymux", "staymux-k-name", "staymux-l"],
+)
+def test_staymux_as_installed_hands_its_arguments_on(host, args, said):
+    # The other tests run main through tests/host/staymux. This runs the file itself, as installed, so that its last
+    # line, which hands main the arguments, is tested too; none of these needs to see its server's cgroup.
+    host.started("alpha")
+    host.started("beta")
+    result = host.run(*args, command=(str(SCRIPT),))
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.startswith(said), result.stdout
 
 
 # --- staymux -l ------------------------------------------------------------------------------------------------------

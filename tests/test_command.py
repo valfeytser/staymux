@@ -4,7 +4,7 @@ Each test gets a host of its own: a private /run/user/$UID, a home with a tmux.c
 tests/host first on PATH, where stubs stand in for systemd, logind and the PID namespace, and tests/host/staymux runs
 staymux itself (it says why it stands in for the kernel's cgroups too). tmux is real. The stubs keep their state in
 the test's host folder: calls (every call), unexpected (calls staymux has no business making, which fail the test),
-linger, policy, run-fails, pid-ns and jobs, each described in the stub that reads it.
+linger, policy, run-fails and pid-ns, each described in the stub that reads it.
 """
 
 import fcntl
@@ -28,9 +28,10 @@ STAYMUX = HOST / "staymux"
 SCRIPT = HOST.parent.parent / "staymux"
 BASH = shutil.which("bash") or "/bin/bash"
 UID = os.getuid()
-ME = subprocess.run(["id", "-un"], capture_output=True, text=True, check=True).stdout.strip()
+ME = subprocess.run(["id", "-un"], capture_output=True, text=True, check=False).stdout.strip()  # as staymux finds it
 RUN = Path(f"/run/user/{UID}")  # where staymux always looks; the sandbox's /run is its own
 SOCK = RUN / "staymux.sock"
+XDG_FOLDERS = ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME")
 HOSTNAME = "testhost"  # bash keeps the one it is given, so no message names the machine running the tests
 # What panes run, pinned: a first pane waits, and a command given to new-window runs in sh, not the login shell.
 TMUX_CONF = "set -g default-shell /bin/sh\nset -g default-command 'exec sleep 3600'\n"
@@ -95,6 +96,7 @@ class Terminal:
         self.host = host
         self.fd, side = os.openpty()
         self.tty = os.ttyname(side)
+        fcntl.ioctl(side, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
         self.pid = os.fork()
         if self.pid == 0:  # as pty.fork, which doesn't say which terminal it made
             try:
@@ -108,7 +110,6 @@ class Terminal:
             finally:
                 os._exit(127)
         os.close(side)
-        fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
         self.shown = bytearray()
         self.reader = threading.Thread(target=self._read, daemon=True)
         self.reader.start()
@@ -140,7 +141,7 @@ class Terminal:
                 return session
         return None
 
-    def attached(self, timeout=10):
+    def attached(self, timeout=25):  # longer than staymux waits for a server to start, so its own message shows
         """The session this run attached its terminal to, once it has, or None if it ended without attaching."""
         found = wait_until(lambda: self.session() or (self._ended() and "ended"), timeout)
         assert found, f"staymux neither attached nor ended within {timeout}s:\n{self.text()}"
@@ -157,10 +158,13 @@ class Terminal:
     def text(self):
         return self.shown.decode(errors="replace").replace("\r\n", "\n")
 
-    def close(self):
+    def end(self):
         if not self._ended():
             os.kill(self.pid, signal.SIGKILL)
             wait_until(self._ended, 5)
+
+    def close(self):
+        """Close the terminal, once nothing holds its other side (see Host.close)."""
         self.reader.join(5)  # it ends once the terminal hangs up; its fd must not be reused under it
         os.close(self.fd)
 
@@ -208,7 +212,7 @@ class Host:
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=40,  # longer than staymux waits for the lock, so its own message shows
             check=False,
         )
 
@@ -245,8 +249,8 @@ class Host:
         """
         self.panes += 1
         out, err, status = (self.state / f"pane{self.panes}.{part}" for part in ("out", "err", "status"))
-        command = f"{' '.join(shlex.quote(word) for word in [str(STAYMUX), *args])} >{shlex.quote(str(out))} 2>{shlex.quote(str(err))}"
-        command += f"; echo $? >{shlex.quote(str(status))}"
+        staymux = " ".join(shlex.quote(word) for word in [str(STAYMUX), *args])
+        command = f"{staymux} >{shlex.quote(str(out))} 2>{shlex.quote(str(err))}; echo $? >{shlex.quote(str(status))}"
         created = self.tmux("new-window", "-t", f"={session}:", command)
         assert created.returncode == 0, created.stderr
 
@@ -255,25 +259,38 @@ class Host:
                 return True
             return ends_server and self.tmux("has-session").returncode != 0
 
-        if not wait_until(ended, 20):
-            said = "".join(path.read_text() for path in (out, err) if path.exists())
-            pytest.fail(f"staymux did not end in the pane within 20s:\n{said}")
-        code = status.read_text() if status.exists() else ""
-        return int(code) if code.endswith("\n") else None, out.read_text(), err.read_text()
+        def read(path):
+            return path.read_text() if path.exists() else ""  # a pane can go before its shell opens them
 
-    def calls(self, command):
-        """The calls staymux made to one of the stubbed commands, each as the list of its arguments."""
+        if not wait_until(ended, 20):
+            pytest.fail(f"staymux did not end in the pane within 20s:\n{read(out)}{read(err)}")
+        code = read(status)
+        return int(code) if code.endswith("\n") else None, read(out), read(err)
+
+    def calls(self, command=None):
+        """The calls staymux made to the stubbed commands, in order, each as the list of its arguments.
+
+        Given a command, its calls only, without its name.
+        """
         log = self.state / "calls"
         calls = [shlex.split(line) for line in log.read_text().splitlines()] if log.exists() else []
-        return [call[1:] for call in calls if call[0] == command]
+        return calls if command is None else [call[1:] for call in calls if call[0] == command]
 
     def close(self):
-        for terminal in self.terminals:
-            terminal.close()
-        self.tmux("kill-server")  # even one whose environment no longer names this test (see started_by)
-        sweep(self.state)
-        for made in ("/run/user", "/run/systemd"):  # host() made both
-            shutil.rmtree(made, ignore_errors=True)
+        """End what the test started and remove what host() made, even if a step fails."""
+        try:
+            for terminal in self.terminals:
+                terminal.end()
+            try:
+                self.tmux("kill-server")  # even one whose environment no longer names this test (see started_by)
+            except subprocess.TimeoutExpired:
+                pass  # a stopped server, say, which the sweep ends
+            sweep(self.state)
+        finally:
+            for terminal in self.terminals:
+                terminal.close()
+            for made in ("/run/user", "/run/systemd"):
+                shutil.rmtree(made, ignore_errors=True)
         unexpected = self.state / "unexpected"
         assert not unexpected.exists(), "staymux made calls no stub expects:\n" + unexpected.read_text()
 
@@ -284,10 +301,10 @@ def host(tmp_path):
     # for what these tests make, which each removes again. So no test can empty a real runtime directory.
     if os.stat("/run").st_uid != UID or os.listdir("/run"):
         pytest.fail("/run is not the sandbox's own, empty one; run the tests with ./run-tests")
-    RUN.mkdir(mode=0o700, parents=True)
-    Path("/run/systemd/system").mkdir(parents=True)
     host = Host(tmp_path)
     try:
+        RUN.mkdir(mode=0o700, parents=True)
+        Path("/run/systemd/system").mkdir(parents=True)
         yield host
     finally:
         host.close()
@@ -412,24 +429,26 @@ def test_staymux_name_refuses_a_name_it_cannot_create(host, name):
     assert host.calls("systemd-run") == []
 
 
-@pytest.mark.parametrize("variable", ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"])
 @pytest.mark.parametrize(
     ("folder", "kept"),
     [("own", True), ("/usr", False), ("missing", False)],
     ids=["own-folder", "someone-elses-folder", "missing-folder"],
 )
-def test_the_sessions_get_a_login_s_own_environment_whatever_staymux_inherited(host, tmp_path, variable, folder, kept):
+def test_the_sessions_get_a_login_s_own_environment_whatever_staymux_inherited(host, tmp_path, folder, kept):
     # After `su -m` or `sudo -E`, the caller's XDG_CONFIG_HOME would give the server their tmux.conf, and the others
     # would give plugins their saved files, such as tmux-resurrect's sessions under XDG_DATA_HOME. Their runtime
     # directory and bus would lead systemctl to their manager, and USER and LOGNAME would name them.
     folder = {"own": str(tmp_path), "missing": str(tmp_path / "missing")}.get(folder, folder)
-    inherited = {variable: folder, "USER": "someone", "LOGNAME": "someone"}
+    inherited = dict.fromkeys(XDG_FOLDERS, folder)
+    inherited.update(USER="someone", LOGNAME="someone")
     inherited.update(XDG_RUNTIME_DIR="/run/user/0", DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/0/bus")
     terminal = host.terminal("alpha", **inherited)
     assert terminal.attached() == "alpha", terminal.text()
     pane = host.tmux("display-message", "-p", "-t", "=alpha:", "#{pane_pid}").stdout.strip()
     env = dict(entry.split("=", 1) for entry in Path(f"/proc/{pane}/environ").read_text().split("\0") if entry)
-    assert env.get(variable) == (folder if kept else None)
+    assert {variable: env.get(variable) for variable in XDG_FOLDERS} == dict.fromkeys(
+        XDG_FOLDERS, folder if kept else None
+    )
     assert (env["USER"], env["LOGNAME"], env["HOME"]) == (ME, ME, str(host.home))
     assert env["XDG_RUNTIME_DIR"] == str(RUN)
     assert env["DBUS_SESSION_BUS_ADDRESS"] == f"unix:path={RUN}/bus"
@@ -468,6 +487,8 @@ def test_staymux_turns_lingering_on_before_it_starts_a_server(host):
         in shown
     )
     assert (host.state / "linger").read_text().strip() == str(UID)
+    commands = [call[0] for call in host.calls()]
+    assert commands.index("busctl") < commands.index("systemd-run")
 
 
 def test_staymux_does_not_wait_for_a_password_nobody_can_give_for_lingering(host):
@@ -494,12 +515,15 @@ def in_a_cgroup_namespace():
 def test_staymux_as_it_is_refuses_a_server_whose_cgroup_it_cannot_see(host):
     # The plain file, without tests/host/staymux standing in for the kernel: in a cgroup namespace such as this
     # sandbox's, no process shows which unit it runs in, so staymux cannot check that its server outlives logout.
-    terminal = host.terminal("alpha", command=(BASH, str(SCRIPT)))
+    # The server runs already, so the file never starts one, nor reads the host's own cgroup tree for leftovers.
+    host.started("alpha")
+    terminal = host.terminal("beta", command=(BASH, str(SCRIPT)))
     assert terminal.attached() is None
     status, shown = terminal.finish()
     assert status == 1
     assert "so cannot check that it runs in staymux.slice and outlives logout.\n" in shown, shown
     assert "  If this runs in a container or sandbox, run staymux outside it.\n" in shown, shown
+    assert host.sessions() == ["alpha"]
 
 
 @pytest.mark.parametrize(

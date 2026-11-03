@@ -640,6 +640,24 @@ def test_staymux_l_cannot_tell_where_its_server_runs_from_another_cgroup_namespa
     )
 
 
+@pytest.mark.skipif(not in_a_cgroup_namespace(), reason="needs the cgroup namespace the sandbox makes where it can")
+def test_staymux_as_it_is_reads_the_kernel_s_cgroup_files_not_ones_it_inherited(host, tmp_path):
+    # The plain file, given a CGROUP_FILES whose forged files show its server in staymux.slice. It reads the kernel's
+    # instead, which in this sandbox's namespace name no unit.
+    host.started("alpha")
+    forged = tmp_path / "forged"
+    server = forged / str(host.server_pid())
+    server.mkdir(parents=True)
+    (server / "cgroup").write_text(
+        f"0::/user.slice/user-{UID}.slice/user@{UID}.service/staymux.slice/staymux-1.scope\n"
+    )
+    result = host.run("-l", command=(BASH, str(SCRIPT)), CGROUP_FILES=str(forged))
+    assert result.returncode == 0
+    assert result.stderr.startswith(
+        f"staymux: cannot tell which cgroup the server (PID {host.server_pid()}) runs in"
+    ), result.stderr
+
+
 # --- staymux -l ------------------------------------------------------------------------------------------------------
 
 

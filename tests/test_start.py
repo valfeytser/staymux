@@ -59,7 +59,7 @@ def test_the_initial_pid_namespace_is_the_one_the_kernel_always_numbers_the_same
 
 def test_staymux_reads_where_processes_run_from_the_kernel_whatever_it_inherited():
     # tests/host/staymux points CGROUP_FILES at files of its own, so this is what checks the value the command reads
-    # from, and that a caller's environment cannot point staymux at files that would pass its server off as safe.
+    # from, and that an inherited CGROUP_FILES cannot point staymux at files that would pass its server off as safe.
     result, _ = run_staymux('printf %s "$CGROUP_FILES"', {**os.environ, "CGROUP_FILES": "/tmp"})
     assert result.returncode == 0, result.stderr
     assert result.stdout == "/proc"

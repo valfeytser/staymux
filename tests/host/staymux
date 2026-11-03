@@ -21,13 +21,13 @@ source "${BASH_SOURCE[0]%/*}/../../staymux" || exit 125
 
 # What follows replaces parts of staymux by name, so a rename there must fail here, not pass by testing less.
 if ! declare -F main pid_cgroup >/dev/null || [[ $(declare -p CGROUP_ROOTS 2>/dev/null) != 'declare -a '* ]] ||
-    [[ $(declare -p CGROUP_FILES 2>/dev/null) != 'declare -- '* ]]; then
-    echo 'tests/host/staymux: staymux lacks main, pid_cgroup, CGROUP_ROOTS or CGROUP_FILES; update this stand-in' >&2
+    [[ $(declare -f pid_cgroup) != *CGROUP_FILES/* ]]; then
+    echo 'tests/host/staymux: staymux lacks main, CGROUP_ROOTS or pid_cgroup reading CGROUP_FILES; update this file' >&2
     exit 125
 fi
 
 CGROUP_ROOTS=("$STAYMUX_TEST_HOST/cgroup")
-CGROUP_FILES=$STAYMUX_TEST_HOST/proc
+CGROUP_FILES=$STAYMUX_TEST_HOST/proc.$$   # this run's own, so that no other run rewrites a file while it reads it
 
 eval "staymux_$(declare -f pid_cgroup)"   # staymux's own reader, as staymux_pid_cgroup
 

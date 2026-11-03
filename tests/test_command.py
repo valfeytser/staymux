@@ -590,7 +590,7 @@ CGROUP_V1 = (
     f"9:devices:/system.slice/sshd.service\n8:cpuset:/\n7:rdma:/\n6:freezer:/\n5:memory:{LOGIN}\n4:hugetlb:/\n"
     "3:perf_event:/\n2:cpu,cpuacct:/\n1:name=systemd:{cgroup}\n"
 )
-HOSTS = {
+CGROUP_LAYOUTS = {
     "v2": "0::{cgroup}\n",
     "v1": CGROUP_V1,
     "v1-with-cgroup2-mounted": CGROUP_V1 + "0::/\n",
@@ -598,20 +598,20 @@ HOSTS = {
 }
 
 
-@pytest.mark.parametrize("cgroups", HOSTS.values(), ids=HOSTS.keys())
-def test_staymux_finds_its_server_in_staymux_slice_on_each_kind_of_host(host, cgroups):
+@pytest.mark.parametrize("layout", CGROUP_LAYOUTS.values(), ids=CGROUP_LAYOUTS.keys())
+def test_staymux_finds_its_server_in_staymux_slice_on_each_kind_of_host(host, layout):
     # staymux refuses to attach to a new server it cannot find in the slice, and staymux -l warns of one.
-    host.cgroups(cgroups)
+    host.cgroups(layout)
     host.started("alpha")
     result = host.run("-l")
     assert (result.returncode, result.stderr) == (0, ""), result.stderr
     assert result.stdout.startswith("  NAME "), result.stdout
 
 
-@pytest.mark.parametrize("cgroups", HOSTS.values(), ids=HOSTS.keys())
-def test_staymux_l_warns_of_a_server_outside_staymux_slice_on_each_kind_of_host(host, cgroups):
+@pytest.mark.parametrize("layout", CGROUP_LAYOUTS.values(), ids=CGROUP_LAYOUTS.keys())
+def test_staymux_l_warns_of_a_server_outside_staymux_slice_on_each_kind_of_host(host, layout):
     # One started from the login with plain tmux on staymux's socket, so it runs in the login's scope.
-    host.cgroups(cgroups)
+    host.cgroups(layout)
     started = host.tmux("new-session", "-d", "-s", "alpha")
     assert started.returncode == 0, started.stderr
     result = host.run("-l")
@@ -623,15 +623,15 @@ def test_staymux_l_warns_of_a_server_outside_staymux_slice_on_each_kind_of_host(
 
 
 @pytest.mark.parametrize(
-    "cgroups",
+    "layout",
     ["0::/\n", "0::/..\n", "0::/../..{cgroup}\n", "1:name=systemd:/../..{cgroup}\n"],
     ids=["at-its-root", "above-its-root", "elsewhere", "elsewhere-on-cgroup-v1"],
 )
-def test_staymux_l_cannot_tell_where_its_server_runs_from_another_cgroup_namespace(host, cgroups):
+def test_staymux_l_cannot_tell_where_its_server_runs_from_another_cgroup_namespace(host, layout):
     # Run in a container, staymux sees its server by a path from the container's cgroup: /, /.. or /../.., which may
     # still end in staymux.slice but says nothing of where the server runs.
     host.started("alpha")
-    host.cgroups(cgroups)
+    host.cgroups(layout)
     result = host.run("-l")
     assert result.returncode == 0
     assert result.stderr == (

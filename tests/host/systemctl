@@ -1,0 +1,15 @@
+#!/bin/bash
+# Stands in for the user's systemd manager: answers that it runs, lists no queued jobs, and accepts the resets and
+# stops staymux asks for, without doing them. Every call is logged in calls; one staymux has no business making goes
+# to unexpected as well, and fails.
+host=${STAYMUX_TEST_HOST:?}
+{ printf systemctl; printf ' %q' "$@"; echo; } >>"$host/calls"
+case $* in
+    '--user show --property=Version') echo 'Version=999' ;;
+    '--user list-jobs --no-legend --full' | '--user list-jobs --no-legend --full staymux.slice' | \
+        '--user reset-failed staymux-*.scope' | \
+        '--user stop staymux.slice' | '--user stop --no-block staymux.slice') ;;
+    *)  printf 'systemctl %s\n' "$*" >>"$host/unexpected"
+        echo "systemctl stub: unexpected call: $*" >&2
+        exit 1 ;;
+esac

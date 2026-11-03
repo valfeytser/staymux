@@ -1,0 +1,24 @@
+#!/bin/bash
+# Stands in for systemd-run --user --scope: runs the command in place of a scope, handing the scope's cgroup down
+# in STAYMUX_TEST_CGROUP for tests/host/staymux to read, or fails as systemd would refuse it if
+# $STAYMUX_TEST_HOST/run-fails exists. Every call is logged in calls.
+host=${STAYMUX_TEST_HOST:?}
+{ printf systemd-run; printf ' %q' "$@"; echo; } >>"$host/calls"
+unit='' slice='' user=0 scope=0
+while [[ $1 == -* ]]; do
+    case $1 in
+        --user) user=1 ;;
+        --scope) scope=1 ;;
+        --unit=*) unit=${1#*=} ;;
+        --slice=*) slice=${1#*=} ;;
+    esac
+    shift
+done
+if ((!user || !scope)) || [[ -z $unit || -z $slice || $# == 0 ]]; then
+    printf 'systemd-run (not a user scope)\n' >>"$host/unexpected"
+    echo 'systemd-run stub: only a user scope with a unit, a slice and a command is expected' >&2
+    exit 1
+fi
+[[ ! -e $host/run-fails ]] || { echo 'Failed to start transient scope unit: Access denied' >&2; exit 1; }
+export STAYMUX_TEST_CGROUP=/user.slice/user-$EUID.slice/user@$EUID.service/$slice/$unit
+exec "$@"

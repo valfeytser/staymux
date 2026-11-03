@@ -1,0 +1,23 @@
+#!/bin/bash
+# Stands in for the PID namespace staymux runs in, which it reads with readlink /proc/self/ns/pid. The sandbox's
+# is a child namespace, so as $STAYMUX_TEST_HOST/pid-ns says: "initial" gives the one the kernel always numbers
+# the same, as on an ordinary host; "unknown" fails, as where /proc/self/ns cannot be read; "child", or no file,
+# gives the sandbox's own. Any other call goes to the real readlink.
+host=${STAYMUX_TEST_HOST:?}
+real() {
+    local dir dirs=()
+    IFS=: read -ra dirs <<<"$PATH"
+    for dir in "${dirs[@]}"; do
+        [[ $dir -ef ${BASH_SOURCE[0]%/*} || ! -x $dir/readlink ]] || { printf '%s\n' "$dir/readlink"; return 0; }
+    done
+    echo 'readlink stub: no other readlink on PATH' >&2
+    return 1
+}
+if [[ $* == /proc/self/ns/pid ]]; then
+    case $(cat "$host/pid-ns" 2>/dev/null) in
+        initial) echo 'pid:[4026531836]'; exit 0 ;;
+        unknown) exit 1 ;;
+    esac
+fi
+readlink=$(real) || exit 1
+exec "$readlink" "$@"

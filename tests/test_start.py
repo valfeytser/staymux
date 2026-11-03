@@ -42,28 +42,13 @@ def run_staymux(commands, env, timeout=10):
     return result, time.monotonic() - started
 
 
-# --- the environment the server gets -----------------------------------------
-
-
-@pytest.mark.parametrize("variable", ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"])
-@pytest.mark.parametrize(
-    ("folder", "kept"),
-    [("own", True), ("/usr", False), ("missing", False)],
-    ids=["own-folder", "someone-elses-folder", "missing-folder"],
-)
-def test_setup_environment_keeps_only_our_own_xdg_folders(tmp_path, variable, folder, kept):
-    # After `su -m` or `sudo -E`, the caller's XDG_CONFIG_HOME would give the server their tmux.conf, and the
-    # others would give plugins their saved files, such as tmux-resurrect's sessions under XDG_DATA_HOME.
-    folder = {"own": str(tmp_path), "missing": str(tmp_path / "missing")}.get(folder, folder)
-    result, _ = run_staymux(f'setup_environment; printf %s "${{{variable}-(unset)}}"', {**os.environ, variable: folder})
-    assert result.returncode == 0, result.stderr
-    assert result.stdout == (folder if kept else "(unset)")
+# --- the initial PID namespace ------------------------------------------------
 
 
 def test_the_initial_pid_namespace_is_the_one_the_kernel_always_numbers_the_same():
-    # The namespace tests in test_recovery.py stand the sandbox's own in for it, so this is what checks the value
-    # holds_socket compares with: PROC_PID_INIT_INO in the kernel's include/linux/proc_ns.h, the same from Linux 3.8
-    # on, as /proc/PID/ns/pid names it.
+    # The namespace tests stand in for it, test_recovery.py's with the sandbox's own namespace and test_command.py's
+    # with tests/host/readlink, so this is what checks the value holds_socket compares with: PROC_PID_INIT_INO in the
+    # kernel's include/linux/proc_ns.h, the same from Linux 3.8 on, as /proc/PID/ns/pid names it.
     result, _ = run_staymux('printf %s "$INIT_PID_NS"', os.environ)
     assert result.returncode == 0, result.stderr
     assert result.stdout == f"pid:[{0xEFFFFFFC}]"
@@ -264,69 +249,11 @@ def test_report_leftovers_says_nothing_of_a_stop_that_finished_while_it_asked(tm
 
 # --- lingering -----------------------------------------------------------------
 
-# Stand in for logind behind busctl and loginctl. SetUserLinger takes a UID, whether to enable lingering,
-# and whether to allow interaction, which busctl also allows unless told
-# --allow-interactive-authorization=no (or false, 0, off). Under $POLICY "admin", setting lingering needs a
-# password: a call that allows interaction waits for one on stdin, as a polkit agent would, and any other
-# fails at once. Under "allowed", it sets or clears lingering for that UID. loginctl show-user reports it.
-STUB_BUSCTL_LOGIND = r"""#!/bin/bash
-[[ " $* " == *' SetUserLinger ubb '* ]] || exit 0
-yes() { case ${1,,} in 1 | y | yes | true | on) return 0 ;; esac; return 1; }
-header=yes
-for arg; do [[ $arg != --allow-interactive-authorization=* ]] || header=${arg#*=}; done
-uid=${*: -3:1} enable=${*: -2:1} interactive=${*: -1:1}
-if [[ $POLICY == allowed ]]; then
-    if yes "$enable"; then echo "$uid" >"$LINGER_FILE"; else rm -f "$LINGER_FILE"; fi
-elif yes "$interactive" || yes "$header"; then
-    echo 'Password: ' >&2
-    read -r _
-    exit 1
-else
-    echo 'Call failed: Interactive authentication required.' >&2
-    exit 1
-fi
-"""
+# Stands in for logind's lingering setting, which loginctl show-user reports: on while $LINGER_FILE holds our UID.
 STUB_LOGINCTL_SHOW_LINGER = r"""#!/bin/bash
 [[ " $* " == *' show-user '* ]] || exit 0
 [[ -e $LINGER_FILE && $(<"$LINGER_FILE") == "$EUID" ]] && echo yes || echo no
 """
-
-
-def ensure_linger(tmp_path, policy):
-    """Run ensure_linger with lingering off, under a polkit policy, and a terminal nobody types into."""
-    env = stubbed_env(tmp_path, busctl=STUB_BUSCTL_LOGIND, loginctl=STUB_LOGINCTL_SHOW_LINGER)
-    env.update(POLICY=policy, LINGER_FILE=str(tmp_path / "linger"))
-    read_end, write_end = os.pipe()  # held open, like a terminal nobody types a password into
-    try:
-        result = subprocess.run(
-            ["bash", "-c", 'source "$1"; ME=someone; ensure_linger', "staymux-test", str(SCRIPT)],
-            env=env,
-            stdin=read_end,
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        )
-    except subprocess.TimeoutExpired:
-        pytest.fail("ensure_linger waited for a password")
-    finally:
-        os.close(read_end)
-        os.close(write_end)
-    return result
-
-
-def test_ensure_linger_does_not_wait_for_a_password_nobody_can_give(tmp_path):
-    # loginctl asks through any polkit agent, its own or one already running, even with --no-ask-password.
-    result = ensure_linger(tmp_path, "admin")
-    assert result.returncode == 1
-    assert "Interactive authentication required" in result.stderr
-    assert not (tmp_path / "linger").exists()
-
-
-def test_ensure_linger_turns_lingering_on_where_policy_allows_it(tmp_path):
-    result = ensure_linger(tmp_path, "allowed")
-    assert result.returncode == 0, result.stderr
-    assert (tmp_path / "linger").read_text().strip() == str(os.getuid())
 
 
 def test_ensure_linger_names_a_missing_busctl(tmp_path):
@@ -339,11 +266,9 @@ def test_ensure_linger_names_a_missing_busctl(tmp_path):
 
 # --- starting the server -------------------------------------------------------
 
-# Stand in for systemd: systemd-run records the scope it was asked for and runs its command in place of
-# one (or fails, if $RUN_FAILS is set), systemctl logs what it is asked, and loginctl says lingering is on.
+# Stand in for systemd: systemd-run runs its command in place of a scope, systemctl logs what it is asked, and
+# loginctl says lingering is on.
 STUB_SYSTEMD_RUN = r"""#!/bin/bash
-for arg; do [[ $arg != --unit=* ]] || printf '%s\n' "${arg#--unit=}" >"$SCOPE_LOG"; done
-[[ -z ${RUN_FAILS:-} ]] || { echo 'Failed to start transient scope unit: Access denied' >&2; exit 1; }
 while [[ $# -gt 0 && $1 != tmux ]]; do shift; done
 exec "$@"
 """
@@ -359,12 +284,11 @@ echo yes
 PATHS = "SOCK=$XDG_RUNTIME_DIR/staymux.sock; STARTING=$XDG_RUNTIME_DIR/staymux.starting; "
 
 
-def start_server(tmp_path, config, run_fails=False, then=None, paths=PATHS, **env_extra):
+def start_server(tmp_path, config, then=None, paths=PATHS):
     """Run start_server with START_TIMEOUT=1, a real tmux and this ~/.tmux.conf, on a socket of its own.
 
-    Set the paths as in paths, and add env_extra to the environment. Call then with the socket and the environment, if given, before listing
-    the sessions. Return the result, the seconds it took, the scope systemd-run was asked for, what systemctl
-    was asked, and the sessions.
+    Set the paths as in paths. Call then with the socket and the environment, if given, before listing the
+    sessions. Return the result, the seconds it took, what systemctl was asked, and the sessions.
     """
     env = stubbed_env(
         tmp_path, systemd_run=STUB_SYSTEMD_RUN, systemctl=STUB_SYSTEMCTL_LOG, loginctl=STUB_LOGINCTL_LINGER_ON
@@ -379,10 +303,7 @@ def start_server(tmp_path, config, run_fails=False, then=None, paths=PATHS, **en
     env.update(
         HOME=str(home),
         STUB_LOG=str(tmp_path / "systemctl.log"),
-        SCOPE_LOG=str(tmp_path / "scope"),
         XDG_RUNTIME_DIR=str(sock_dir),
-        RUN_FAILS="1" if run_fails else "",
-        **env_extra,
     )
     try:
         result, took = run_staymux(paths + "START_TIMEOUT=1; start_server first", env, timeout=15)
@@ -402,35 +323,11 @@ def start_server(tmp_path, config, run_fails=False, then=None, paths=PATHS, **en
         subprocess.run(["pkill", "-KILL", "-f", str(sock)], check=False)
         subprocess.run(["pkill", "-KILL", "-f", "sleep 58.7"], check=False)  # the blocking config's job
         subprocess.run(["pkill", "-KILL", "-f", "sleep 2.7"], check=False)  # the slow config's job
-    scope_log = tmp_path / "scope"
     systemctl_log = tmp_path / "systemctl.log"
-    return (
-        result,
-        took,
-        scope_log.read_text().strip() if scope_log.exists() else "",
-        systemctl_log.read_text().splitlines() if systemctl_log.exists() else [],
-        sessions,
-    )
+    return result, took, systemctl_log.read_text().splitlines() if systemctl_log.exists() else [], sessions
 
 
 pytestmark_tmux = pytest.mark.skipif(not shutil.which("tmux"), reason="native tmux required")
-
-
-@pytestmark_tmux
-def test_start_server_starts_a_server_with_its_first_session(tmp_path):
-    result, _, scope, _, sessions = start_server(tmp_path, "set -g @loaded yes\n")
-    assert result.returncode == 0, result.stderr
-    assert scope.startswith("staymux-") and scope.endswith(".scope")
-    assert sessions == ["first"]
-
-
-@pytestmark_tmux
-def test_start_server_reports_a_scope_that_systemd_refuses(tmp_path):
-    result, _, _, _, sessions = start_server(tmp_path, "", run_fails=True)
-    assert result.returncode == 1
-    assert "Failed to start transient scope unit: Access denied" in result.stderr, result.stderr
-    assert "could not start the tmux server" in result.stderr
-    assert sessions == []
 
 
 @pytestmark_tmux
@@ -440,7 +337,7 @@ def test_start_server_stops_waiting_for_a_configuration_that_never_finishes_load
     # and its lock, for as long. The config may already have started work (restored panes, say), so the
     # server is left running and the message says how to stop it.
     config = "run-shell \"trap '' TERM; exec sleep 58.7\"\n"
-    result, took, _, systemctl, _ = start_server(tmp_path, config)
+    result, took, systemctl, _ = start_server(tmp_path, config)
     assert result.returncode == 1
     assert "did not finish starting within 1s" in result.stderr, result.stderr
     assert "If it is stuck, stop it with: staymux -k all" in result.stderr, result.stderr
@@ -463,22 +360,9 @@ def test_start_server_lets_a_slow_configuration_finish_starting_after_it_stops_w
             pass
         time.sleep(3)  # the config's sleep has ended by now, so its client has created the session
 
-    result, _, _, _, sessions = start_server(tmp_path, config, then=another_client_meanwhile)
+    result, _, _, sessions = start_server(tmp_path, config, then=another_client_meanwhile)
     assert "did not finish starting within 1s" in result.stderr, result.stderr
     assert loads.read_text().splitlines() == ["loaded"]
-    assert sessions == ["first"]
-
-
-@pytestmark_tmux
-@pytest.mark.parametrize(
-    "env_extra",
-    [{"SHELLOPTS": "noclobber"}, {"TMPDIR": "/proc"}],
-    ids=["inherited-noclobber", "unwritable-tmpdir"],
-)
-def test_start_server_starts_whatever_the_caller_s_shell_settings(tmp_path, env_extra):
-    # Both reach staymux through su -m or sudo -E, and neither stops main from starting.
-    result, _, _, _, sessions = start_server(tmp_path, "", **env_extra)
-    assert result.returncode == 0, result.stderr
     assert sessions == ["first"]
 
 
@@ -486,7 +370,7 @@ def test_start_server_starts_whatever_the_caller_s_shell_settings(tmp_path, env_
 def test_start_server_does_not_start_a_server_it_cannot_record_as_starting(tmp_path):
     # Without the record a later run would not wait for it, should it take longer than START_TIMEOUT.
     paths = PATHS.replace("$XDG_RUNTIME_DIR/staymux.starting", "$XDG_RUNTIME_DIR/missing/staymux.starting")
-    result, _, _, _, sessions = start_server(tmp_path, "", paths=paths)
+    result, _, _, sessions = start_server(tmp_path, "", paths=paths)
     assert result.returncode == 1
     assert "cannot record the start of the new tmux server" in result.stderr, result.stderr
     assert "could not start the tmux server" in result.stderr, result.stderr

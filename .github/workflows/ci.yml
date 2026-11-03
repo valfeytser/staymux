@@ -21,7 +21,7 @@ jobs:
       - name: Let bubblewrap create user namespaces
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: shellcheck
-        run: shellcheck staymux
+        run: shellcheck -x staymux tests/host/*
       # STAYMUX_NO_SKIPS fails the run on a skipped test, such as a namespace test the runner no longer allows.
       - name: Tests, none skipped
         run: STAYMUX_NO_SKIPS=1 /usr/bin/python3 run-tests -rs

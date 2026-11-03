@@ -44,36 +44,41 @@ def wait_until(condition, timeout, step=0.02):
         time.sleep(step)
 
 
-def ancestors():
-    """This process and the ones it descends from."""
-    pids, pid = set(), os.getpid()
-    while pid > 0 and pid not in pids:
-        pids.add(pid)
-        status = Path(f"/proc/{pid}/status").read_text()
-        pid = int(next(line.split()[1] for line in status.splitlines() if line.startswith("PPid:")))
+def started_by(state):
+    """The processes whose environment names state as their STAYMUX_TEST_HOST.
+
+    That is whatever one test started, from staymux to the tmux server and its panes, and nothing else.
+    """
+    marker = f"STAYMUX_TEST_HOST={state}".encode()
+    pids = []
+    for entry in Path("/proc").iterdir():
+        try:
+            if (
+                entry.name.isdigit()
+                and int(entry.name) != os.getpid()
+                and marker in (entry / "environ").read_bytes().split(b"\0")
+            ):
+                pids.append(int(entry.name))
+        except OSError:  # gone meanwhile, or not ours
+            pass
     return pids
 
 
-def sweep():
-    """End every process in the sandbox but this one and its ancestors: whatever a test started, servers included.
-
-    The sandbox has a PID namespace of its own, so nothing else runs in it.
-    """
-    keep = ancestors()
-    others = [int(entry.name) for entry in Path("/proc").iterdir() if entry.name.isdigit()]
-    others = [pid for pid in others if pid not in keep]
-    for pid in others:
+def sweep(state):
+    """End the processes one test started and wait until they have gone."""
+    pids = started_by(state)
+    for pid in pids:
         try:
             os.kill(pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
 
     def gone():
-        for pid in others:
+        for pid in pids:
             try:
                 if Path(f"/proc/{pid}/stat").read_text().rpartition(")")[2].split()[0] != "Z":
                     return False
-            except (FileNotFoundError, ProcessLookupError):
+            except OSError:
                 pass
         return True
 
@@ -263,7 +268,7 @@ class Host:
     def close(self):
         for terminal in self.terminals:
             terminal.close()
-        sweep()
+        sweep(self.state)
         shutil.rmtree(RUN, ignore_errors=True)
         unexpected = self.state / "unexpected"
         assert not unexpected.exists(), "staymux made calls no stub expects:\n" + unexpected.read_text()
@@ -271,6 +276,11 @@ class Host:
 
 @pytest.fixture
 def host(tmp_path):
+    # The sandbox's /run starts empty and holds only what these tests make, so anything else is a real one, which a
+    # test must never empty.
+    found = sorted(set(os.listdir("/run")) - {"user", "systemd"})
+    if found:
+        pytest.fail(f"/run holds {', '.join(found)}, so it is not the sandbox's own; run the tests with ./run-tests")
     shutil.rmtree(RUN, ignore_errors=True)
     RUN.mkdir(mode=0o700, parents=True)
     Path("/run/systemd/system").mkdir(parents=True, exist_ok=True)

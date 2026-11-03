@@ -270,7 +270,7 @@ class Host:
             terminal.close()
         self.tmux("kill-server")  # even one whose environment no longer names this test (see started_by)
         sweep(self.state)
-        for made in ("/run/user", "/run/systemd"):  # the fixture made both; see host()
+        for made in ("/run/user", "/run/systemd"):  # host() made both
             shutil.rmtree(made, ignore_errors=True)
         unexpected = self.state / "unexpected"
         assert not unexpected.exists(), "staymux made calls no stub expects:\n" + unexpected.read_text()
@@ -278,14 +278,12 @@ class Host:
 
 @pytest.fixture
 def host(tmp_path):
-    # The sandbox's /run starts empty and holds only what these tests make, so anything else is a real one, which a
-    # test must never empty.
-    found = sorted(set(os.listdir("/run")) - {"user", "systemd"})
-    if found:
-        pytest.fail(f"/run holds {', '.join(found)}, so it is not the sandbox's own; run the tests with ./run-tests")
-    shutil.rmtree(RUN, ignore_errors=True)
+    # A real /run belongs to root; the sandbox mounts one of its own, owned by whoever runs the tests and empty but
+    # for what these tests make, which each removes again. So no test can empty a real runtime directory.
+    if os.stat("/run").st_uid != UID or os.listdir("/run"):
+        pytest.fail("/run is not the sandbox's own, empty one; run the tests with ./run-tests")
     RUN.mkdir(mode=0o700, parents=True)
-    Path("/run/systemd/system").mkdir(parents=True, exist_ok=True)
+    Path("/run/systemd/system").mkdir(parents=True)
     host = Host(tmp_path)
     try:
         yield host

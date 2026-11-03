@@ -7,6 +7,7 @@ the test's host folder: calls (every call), unexpected (calls staymux has no bus
 linger, policy, run-fails and pid-ns, each described in the stub that reads it.
 """
 
+import contextlib
 import fcntl
 import os
 import shlex
@@ -289,8 +290,14 @@ class Host:
         finally:
             for terminal in self.terminals:
                 terminal.close()
-            for made in ("/run/user", "/run/systemd"):
+            for made in (RUN, Path("/run/systemd/system")):
                 shutil.rmtree(made, ignore_errors=True)
+            for parent in (
+                "/run/user",
+                "/run/systemd",
+            ):  # host() made these too, so remove them if nothing else is in them
+                with contextlib.suppress(OSError):
+                    os.rmdir(parent)
         unexpected = self.state / "unexpected"
         assert not unexpected.exists(), "staymux made calls no stub expects:\n" + unexpected.read_text()
 

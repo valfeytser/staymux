@@ -9,7 +9,6 @@ linger, policy, run-fails, pid-ns and jobs, each described in the stub that read
 
 import fcntl
 import os
-import pty
 import shlex
 import shutil
 import signal
@@ -94,12 +93,21 @@ class Terminal:
 
     def __init__(self, host, argv, env):
         self.host = host
-        self.pid, self.fd = pty.fork()
-        if self.pid == 0:
+        self.fd, side = os.openpty()
+        self.tty = os.ttyname(side)
+        self.pid = os.fork()
+        if self.pid == 0:  # as pty.fork, which doesn't say which terminal it made
             try:
+                os.setsid()
+                os.close(self.fd)
+                for fd in (0, 1, 2):
+                    os.dup2(side, fd)
+                os.close(side)
+                os.close(os.open(self.tty, os.O_RDWR))  # the first terminal a session leader opens becomes its own
                 os.execve(argv[0], argv, env)
             finally:
                 os._exit(127)
+        os.close(side)
         fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
         self.shown = bytearray()
         self.reader = threading.Thread(target=self._read, daemon=True)
@@ -123,31 +131,25 @@ class Terminal:
                 self.status = os.WEXITSTATUS(status) if os.WIFEXITED(status) else -os.WTERMSIG(status)
         return self.status is not None
 
-    def client(self):
-        """This run's tmux client as tmux lists it: its tty and session, or None while it has none."""
-        # staymux execs tmux attach-session, so the client keeps this run's PID.
-        listed = self.host.tmux("list-clients", "-F", "#{client_pid} #{client_tty} #{session_name}").stdout
+    def session(self):
+        """The session a tmux client shows on this terminal, or None while none does."""
+        listed = self.host.tmux("list-clients", "-F", "#{client_tty} #{session_name}").stdout
         for line in listed.splitlines():
-            pid, tty, session = line.split(" ", 2)
-            if pid == str(self.pid):
-                return tty, session
+            tty, session = line.split(" ", 1)
+            if tty == self.tty:
+                return session
         return None
 
     def attached(self, timeout=10):
         """The session this run attached its terminal to, once it has, or None if it ended without attaching."""
-        found = wait_until(lambda: self.client() or (self._ended() and "ended"), timeout)
+        found = wait_until(lambda: self.session() or (self._ended() and "ended"), timeout)
         assert found, f"staymux neither attached nor ended within {timeout}s:\n{self.text()}"
-        return None if found == "ended" else found[1]
-
-    def session(self):
-        found = self.client()
-        return found and found[1]
+        return None if found == "ended" else found
 
     def finish(self, timeout=10):
         """Detach this run's client, if it has one, and return its exit status and what it showed."""
-        found = self.client()
-        if found:
-            self.host.tmux("detach-client", "-t", found[0])
+        if self.session():
+            self.host.tmux("detach-client", "-t", self.tty)
         assert wait_until(self._ended, timeout), f"staymux did not end within {timeout}s:\n{self.text()}"
         self.reader.join(timeout)
         return self.status, self.text()

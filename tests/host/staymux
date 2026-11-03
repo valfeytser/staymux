@@ -32,7 +32,7 @@ pid_cgroup() {
     while IFS= read -r -d '' entry; do
         [[ $entry != STAYMUX_TEST_CGROUP=* ]] || PID_CGROUP=${entry#*=}
     done 2>/dev/null <"/proc/$1/environ"
-    [[ -e /proc/$1 ]]   # it may have gone while being read
+    [[ -e /proc/$1 ]] || { PID_CGROUP=''; return 1; }   # it may have gone while being read
 }
 
 main "$@"

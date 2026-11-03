@@ -640,22 +640,19 @@ def test_staymux_l_cannot_tell_where_its_server_runs_from_another_cgroup_namespa
     )
 
 
-@pytest.mark.skipif(not in_a_cgroup_namespace(), reason="needs the cgroup namespace the sandbox makes where it can")
 def test_staymux_as_it_is_reads_the_kernel_s_cgroup_files_not_ones_it_inherited(host, tmp_path):
-    # The plain file, given a CGROUP_FILES whose forged files show its server in staymux.slice. It reads the kernel's
-    # instead, which in this sandbox's namespace name no unit.
+    # The plain file, given a CGROUP_FILES whose forged file puts its server in a scope of its own. It reads the
+    # kernel's instead, which name no unit in this sandbox's cgroup namespace and the runner's own cgroup without one,
+    # so it never names the forged scope.
     host.started("alpha")
     forged = tmp_path / "forged"
     server = forged / str(host.server_pid())
     server.mkdir(parents=True)
-    (server / "cgroup").write_text(
-        f"0::/user.slice/user-{UID}.slice/user@{UID}.service/staymux.slice/staymux-1.scope\n"
-    )
+    (server / "cgroup").write_text(f"0::/user.slice/user-{UID}.slice/forged.scope\n")
     result = host.run("-l", command=(BASH, str(SCRIPT)), CGROUP_FILES=str(forged))
     assert result.returncode == 0
-    assert result.stderr.startswith(
-        f"staymux: cannot tell which cgroup the server (PID {host.server_pid()}) runs in"
-    ), result.stderr
+    assert result.stdout.startswith("  NAME "), result.stdout
+    assert "forged.scope" not in result.stderr, result.stderr
 
 
 # --- staymux -l ------------------------------------------------------------------------------------------------------
